@@ -17,6 +17,8 @@
 #include <linux/page-isolation.h>
 #include <linux/xxhash.h>
 
+#include "kexec_internal.h"
+
 static bool kho_enable __ro_after_init;
 
 static int __init kho_parse_enable(char *p)
@@ -162,6 +164,92 @@ void *kho_claim_mem(const struct kho_mem *mem)
 	return va;
 }
 EXPORT_SYMBOL_GPL(kho_claim_mem);
+
+int kho_fill_kimage(struct kimage *image)
+{
+	ssize_t scratch_size;
+	int err = 0;
+
+	mutex_lock(&kho_out.lock);
+
+	if (!kho_out.active)
+		goto out;
+
+	/* Set delay_termination to load device tree in kernel_kexec(). */
+	image->delay_termination = 1;
+
+	/* Allocate target memory for kho dt */
+	struct kexec_buf dt = {
+		.image = image,
+		.buffer = NULL,
+		.bufsz = 0,
+		.mem = KEXEC_BUF_MEM_UNKNOWN,
+		.memsz = kho_out.dt_max,
+		.buf_align = SZ_64K, /* Makes it easier to map */
+		.buf_max = ULONG_MAX,
+		.top_down = true,
+	};
+	err = kexec_add_buffer(&dt);
+	if (err) {
+		pr_err("Failed to reserved a segment for device tree: %d\n", err);
+		goto out;
+	}
+	image->kho.dt = &image->segment[image->nr_segments - 1];
+
+	scratch_size = sizeof(*kho_scratch) * kho_scratch_cnt;
+	struct kexec_buf scratch = {
+		.image = image,
+		.buffer = kho_scratch,
+		.bufsz = scratch_size,
+		.mem = KEXEC_BUF_MEM_UNKNOWN,
+		.memsz = scratch_size,
+		.buf_align = SZ_64K, /* Makes it easier to map */
+		.buf_max = ULONG_MAX,
+		.top_down = true,
+	};
+	err = kexec_add_buffer(&scratch);
+	if (err) 
+		goto out;
+	image->kho.scratch = &image->segment[image->nr_segments - 1];
+
+out:
+	mutex_unlock(&kho_out.lock);
+	return err;
+}
+
+static int kho_walk_scratch(struct kexec_buf *kbuf,
+			    int (*func)(struct resource *, void *))
+{
+	int ret = 0;
+	int i;
+
+	for (i = 0; i < kho_scratch_cnt; i++) {
+		struct resource res = {
+			.start = kho_scratch[i].addr,
+			.end = kho_scratch[i].addr + kho_scratch[i].size - 1,
+		};
+
+		/* Try to fit the kimage into our KHO scratch region */
+		ret = func(&res, kbuf);
+		if (ret)
+			break;
+	}
+
+	return ret;
+}
+
+int kho_locate_mem_hole(struct kexec_buf *kbuf,
+			int (*func)(struct resource *, void *))
+{
+	int ret;
+
+	if (!kho_out.active || kbuf->image->type == KEXEC_TYPE_CRASH)
+		return 1;
+
+	ret = kho_walk_scratch(kbuf, func);
+
+	return ret == 1 ? 0 : -EADDRNOTAVAIL;
+}
 
 /* Handling for /sys/kernel/kho */
 
