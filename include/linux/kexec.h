@@ -487,6 +487,57 @@ void set_kexec_sig_enforced(void);
 static inline void set_kexec_sig_enforced(void) {}
 #endif
 
+/* KHO Notifier index */
+enum kho_event {
+	KEXEC_KHO_DUMP = 0,
+	KEXEC_KHO_ABORT = 1,
+};
+
+struct notifier_block;
+
+#ifdef CONFIG_KEXEC_HANDOVER
+#include <linux/hashtable.h>
+#define KHO_HASHTABLE_BITS 4
+struct kho_node {
+    struct hlist_node hlist;
+
+	struct list_head list;
+	bool visited;
+
+	rwlock_t lock; /* Protects the following fields */
+    const char *name;
+    DECLARE_HASHTABLE(props, KHO_HASHTABLE_BITS);
+    DECLARE_HASHTABLE(nodes, KHO_HASHTABLE_BITS);
+};
+
+#define KHO_NODE_INIT(name) { \
+		.lock = __RW_LOCK_UNLOCKED((name).lock), \
+		.props = HASHTABLE_INIT(KHO_HASHTABLE_BITS), \
+		.nodes = HASHTABLE_INIT(KHO_HASHTABLE_BITS), \
+	}
+
+void kho_init_node(struct kho_node* node);
+int kho_add_node(struct kho_node* parent, const char* name, struct kho_node* child);
+int kho_remove_node(struct kho_node* parent, const char* name);
+int kho_add_prop(struct kho_node* node, const char* key, const void* val, u32 size);
+int kho_remove_prop(struct kho_node* node, const char* key);
+
+int register_kho_notifier(struct notifier_block *nb);
+int unregister_kho_notifier(struct notifier_block *nb);
+void kho_memory_init(void);
+int kho_convert_tree(void);
+#else
+static inline void kho_init_node(struct kho_node* node) { }
+static inline int kho_add_node(struct kho_node* parent, const char* name, struct kho_node* child) { return 0; }
+static inline int kho_remove_node(struct kho_node* parent, const char* name) { return 0; }
+static inline int kho_add_prop(struct kho_node* node, const char* key, const void* val, u32 size) { return 0; }
+static inline int kho_remove_prop(struct kho_node* node, const char* key) { return 0; }
+static inline int register_kho_notifier(struct notifier_block *nb) { return 0; }
+static inline int unregister_kho_notifier(struct notifier_block *nb) { return 0; }
+static inline void kho_memory_init(void) {}
+static inline int kho_convert_tree(void) { return 0; }
+#endif /* CONFIG_KEXEC_HANDOVER */
+
 #endif /* !defined(__ASSEBMLY__) */
 
 #endif /* LINUX_KEXEC_H */
