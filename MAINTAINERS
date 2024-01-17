@@ -12827,6 +12827,7 @@ L:	kexec@lists.infradead.org
 S:	Maintained
 W:	http://kernel.org/pub/linux/utils/kernel/kexec/
 F:	include/linux/kexec.h
+F:	include/linux/kexec_handover.h
 F:	include/uapi/linux/kexec.h
 F:	kernel/kexec*
 
