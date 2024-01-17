@@ -3,8 +3,6 @@
 #define LINUX_KEXEC_HANDOVER_H
 
 #include <linux/types.h>
-#include <linux/hashtable.h>
-#include <linux/notifier.h>
 
 struct kho_mem {
 	phys_addr_t addr;
@@ -16,6 +14,13 @@ enum kho_event {
 	KEXEC_KHO_FINALIZE = 0,
 	KEXEC_KHO_UNFREEZE = 1,
 };
+
+#ifdef _SETUP
+struct notifier_block;
+struct kho_node;
+#else
+#include <linux/notifier.h>
+#include <linux/hashtable.h>
 
 #define KHO_HASHTABLE_BITS 4
 #define KHO_NODE_INIT { \
@@ -33,6 +38,7 @@ struct kho_node {
 	DECLARE_HASHTABLE(props, KHO_HASHTABLE_BITS);
 	DECLARE_HASHTABLE(nodes, KHO_HASHTABLE_BITS);
 };
+#endif /* _SETUP */
 
 #ifdef CONFIG_KEXEC_HANDOVER
 bool kho_is_enabled(void);
