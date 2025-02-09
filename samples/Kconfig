@@ -300,6 +300,13 @@ config SAMPLE_CHECK_EXEC
 	  demonstrate how they should be used with execveat(2) +
 	  AT_EXECVE_CHECK.
 
+config SAMPLE_KHO
+	bool "KEXEC HandOver demo"
+	depends on KEXEC_HANDOVER
+	help
+	  Build a demo driver to show preserving kernel module states across
+	  kernel kexec using KHO.
+
 source "samples/rust/Kconfig"
 
 source "samples/damon/Kconfig"
