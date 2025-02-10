@@ -1001,6 +1001,10 @@ int kernel_kexec(void)
 		goto Unlock;
 	}
 
+	error = kho_convert_tree();
+	if (error)
+		goto Unlock;
+
 	if (kexec_image->delay_termination)
 		kimage_terminate(kexec_image);
 
