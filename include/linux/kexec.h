@@ -324,6 +324,10 @@ struct kimage {
 	 */
 	unsigned int hotplug_support:1;
 #endif
+	/* If set, it is allowed to reserve a kexec segment by adding an
+	 * empty buffer and delay kimage_terminate() until kernel_kexec().
+	 */
+	unsigned int delay_termination:1;
 
 #ifdef ARCH_HAS_KIMAGE_ARCH
 	struct kimage_arch arch;

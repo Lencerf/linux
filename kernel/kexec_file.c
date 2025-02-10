@@ -402,6 +402,11 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		struct kexec_segment *ksegment;
 
 		ksegment = &image->segment[i];
+		if (ksegment->bufsz == 0) {
+			BUG_ON(!image->delay_termination);
+			continue;
+		}
+
 		kexec_dprintk("segment[%d]: buf=0x%p bufsz=0x%zx mem=0x%lx memsz=0x%zx\n",
 			      i, ksegment->buf, ksegment->bufsz, ksegment->mem,
 			      ksegment->memsz);
@@ -411,7 +416,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 			goto out;
 	}
 
-	kimage_terminate(image);
+	if (!image->delay_termination)
+		kimage_terminate(image);
 
 	ret = machine_kexec_post_load(image);
 	if (ret)
@@ -666,6 +672,10 @@ int kexec_add_buffer(struct kexec_buf *kbuf)
 	if (kbuf->image->nr_segments >= KEXEC_SEGMENT_MAX)
 		return -EINVAL;
 
+	/* Callers must set delay_termination before adding an empty buffer */
+	if (!kbuf->bufsz && !kbuf->image->delay_termination) 
+		return -EINVAL;
+
 	/*
 	 * Make sure we are not trying to add buffer after allocating
 	 * control pages. All segments need to be placed first before
@@ -763,6 +773,11 @@ static int kexec_calculate_store_digests(struct kimage *image)
 		 */
 		if (ksegment->kbuf == pi->purgatory_buf)
 			continue;
+
+		if (ksegment->bufsz == 0) {
+			BUG_ON(!image->delay_termination);
+			continue;
+		}
 
 		ret = crypto_shash_update(desc, ksegment->kbuf,
 					  ksegment->bufsz);

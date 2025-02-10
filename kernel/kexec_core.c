@@ -243,6 +243,8 @@ struct kimage *do_kimage_alloc_init(void)
 	image->elfcorehdr_updated = false;
 #endif
 
+	image->delay_termination = 0;
+
 	return image;
 }
 
@@ -998,6 +1000,9 @@ int kernel_kexec(void)
 		error = -EINVAL;
 		goto Unlock;
 	}
+
+	if (kexec_image->delay_termination)
+		kimage_terminate(kexec_image);
 
 #ifdef CONFIG_KEXEC_JUMP
 	if (kexec_image->preserve_context) {
