@@ -172,19 +172,15 @@ int kho_fill_kimage(struct kimage *image)
 {
 	ssize_t scratch_size;
 	int err = 0;
-	unsigned long dt_size = 0;
 
 	if (!kho_enable)
 		return 0;
 
 	/* Allocate target memory for KHO FDT */
-	if (kho_out.fdt)
-		dt_size = fdt_totalsize(kho_out.fdt);
-
 	struct kexec_buf fdt = {
 		.image = image,
-		.buffer = kho_out.fdt,
-		.bufsz = dt_size,
+		.buffer = NULL,
+		.bufsz = 0,
 		.mem = KEXEC_BUF_MEM_UNKNOWN,
 		.memsz = FDT_MAX,
 		.buf_align = SZ_64K, /* Makes it easier to map */
@@ -670,6 +666,34 @@ unfreeze:
 	}
 
 	return err;
+}
+
+int kho_copy_fdt(struct kimage *image)
+{
+	int err = 0;
+	void *fdt;
+
+	if (!kho_enable || !image->file_mode)
+		return 0;
+
+	if (!kho_out.fdt) {
+		err = kho_finalize();
+		kho_out_update_sysfs_fdt();
+		if (err)
+			return err;
+	}
+
+	fdt = kimage_map_segment(image, image->kho.fdt->mem, PAGE_ALIGN(FDT_MAX));
+	if (!fdt) {
+		pr_err("failed to vmap fdt ksegment in kimage\n");
+		return -ENOMEM;
+	}
+
+	memcpy(fdt, kho_out.fdt, fdt_totalsize(kho_out.fdt));
+
+	kimage_unmap_segment(fdt);
+
+	return 0;
 }
 
 /* Handling for /sys/kernel/kho */

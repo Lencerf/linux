@@ -777,6 +777,12 @@ static int kexec_calculate_store_digests(struct kimage *image)
 		if (ksegment->kbuf == pi->purgatory_buf)
 			continue;
 
+#ifdef CONFIG_KEXEC_HANDOVER
+		/* Skip KHO FDT as its contects are copied in kernel_kexec(). */
+		if (ksegment == image->kho.fdt)
+			continue;
+#endif
+
 		ret = crypto_shash_update(desc, ksegment->kbuf,
 					  ksegment->bufsz);
 		if (ret)
