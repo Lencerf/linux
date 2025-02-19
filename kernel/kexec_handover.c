@@ -17,6 +17,7 @@
 #include <linux/kexec_handover.h>
 #include <linux/page-isolation.h>
 #include <linux/rwsem.h>
+#include <linux/xxhash.h>
 /*
  * KHO is tightly coupled with mm init and needs access to some of mm
  * internal APIs.
@@ -85,35 +86,261 @@ EXPORT_SYMBOL_GPL(unregister_kho_notifier);
 
 /* Helper functions for KHO state tree */
 
+struct kho_prop {
+	struct hlist_node hlist;
+
+	const char *key;
+	const void *val;
+	u32 size;
+};
+
+static unsigned long strhash(const char *s)
+{
+	return xxhash(s, strlen(s), 1120);
+}
+
 void kho_init_node(struct kho_node *node)
 {
+	hash_init(node->props);
+	hash_init(node->nodes);
 }
+EXPORT_SYMBOL_GPL(kho_init_node);
 
+/**
+ * kho_add_node - add a child node to a parent node.
+ * @parent: parent node to add to.
+ * @name: name of the child node.
+ * @child: child node.
+ *
+ * If @parent is NULL, @child is added to KHO state tree root node.
+ *
+ * @child must be a valid pointer through KHO FDT finalization.
+ * @name is duplicated and thus can have a short lifttime.
+ *
+ * Return: 0 on success, or the following error,
+ *  - -ENOENT: @parent is NULL but KHO is not enabled,
+ *  - -ENOMEM: failed to duplicate @name,
+ *  - -EBUSY: KHO FDT has been finalized,
+ *  - -EEXIST: Another node of the same name has been added to the parent.
+ */
 int kho_add_node(struct kho_node *parent, const char *name, struct kho_node *child)
 {
-	return 0;
-}
+	unsigned long name_hash;
+	int err = 0;
+	struct kho_node *node;
+	char *n;
 
+	if (!parent) {
+		if (kho_enable)
+			parent = &kho_out.root;
+		else
+			return -ENOENT;
+	}
+
+	n = kstrdup(name, GFP_KERNEL);
+	if (!n)
+		return -ENOMEM;
+
+	name_hash = strhash(n);
+
+	if (parent == &kho_out.root)
+		down_write(&kho_out.tree_lock);
+	else
+		down_read(&kho_out.tree_lock);
+
+
+	if (kho_out.fdt) {
+		err = -EBUSY;
+		goto out;
+	}
+
+	hash_for_each_possible(parent->nodes, node, hlist, name_hash)
+		if (!strcmp(node->name, n)) {
+			err = -EEXIST;
+			break;
+		}
+	if (err == 0) {
+		child->name = n;
+		hash_add(parent->nodes, &child->hlist, name_hash);
+	}
+
+out:
+	if (parent == &kho_out.root)
+		up_write(&kho_out.tree_lock);
+	else
+		up_read(&kho_out.tree_lock);
+
+	if (err)
+		kfree(n);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(kho_add_node);
+
+/**
+ * kho_remove_node - remove a child node from a parent node.
+ * @parent: parent node to look up for.
+ * @name: name of the child node.
+ *
+ * If @parent is NULL, KHO state tree root node is looked up.
+ *
+ * Return: the pointer to the child node on success, or the following error pointer,
+ *  - -ENOENT: @parent is NULL but KHO is not enabled, or no node named @name is found.
+ *  - -EBUSY: KHO FDT has been finalized.
+ */
 struct kho_node *kho_remove_node(struct kho_node *parent, const char *name)
 {
-	return NULL;
-}
+	struct kho_node *child, *ret = ERR_PTR(-ENOENT);
+	unsigned long name_hash;
 
+	if (!parent) {
+		if (kho_enable)
+			parent = &kho_out.root;
+		else
+			return ERR_PTR(-ENOENT);
+	}
+
+	name_hash = strhash(name);
+
+	if (parent == &kho_out.root)
+		down_write(&kho_out.tree_lock);
+	else
+		down_read(&kho_out.tree_lock);
+
+	if (kho_out.fdt) {
+		ret = ERR_PTR(-EBUSY);
+		goto out;
+	}
+
+	hash_for_each_possible(parent->nodes, child, hlist, name_hash)
+		if (!strcmp(child->name, name)) {
+			ret = child;
+			break;
+		}
+
+	if (!IS_ERR(ret)) {
+		hash_del(&ret->hlist);
+		kfree(ret->name);
+		ret->name = NULL;
+	}
+
+out:
+	if (parent == &kho_out.root)
+		up_write(&kho_out.tree_lock);
+	else
+		up_read(&kho_out.tree_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(kho_remove_node);
+
+/**
+ * kho_add_prop - add a property to a node.
+ * @node: KHO node to add the property to.
+ * @key: key of the property.
+ * @val: pointer to the property value.
+ * @size: size of the property value in bytes.
+ *
+ * @val and @key must be valid pointers through KHO FDT finalization.
+ * Generally @key is a string literal with static lifetime.
+ *
+ * Return: 0 on success, or the following error,
+ *  - -ENOMEM: failed to allocate memory,
+ *  - -EBUSY: KHO FDT has been finalized,
+ *  - -EEXIST: Another property of the same key exists,
+ */
 int kho_add_prop(struct kho_node *node, const char *key, const void *val, u32 size)
 {
-	return 0;
-}
+	unsigned long key_hash;
+	int err = 0;
+	struct kho_prop *prop, *p;
 
+	key_hash = strhash(key);
+	prop = kmalloc(sizeof(*prop), GFP_KERNEL);
+	if (!prop)
+		return -ENOMEM;
+
+	prop->key = key;
+	prop->val = val;
+	prop->size = size;
+
+	down_read(&kho_out.tree_lock);
+	if (kho_out.fdt) {
+		err = -EBUSY;
+		goto out;
+	}
+
+	hash_for_each_possible(node->props, p, hlist, key_hash)
+		if (!strcmp(p->key, key)) {
+			err = -EEXIST;
+			break;
+		}
+	if (!err)
+		hash_add(node->props, &prop->hlist, key_hash);
+
+out:
+	up_read(&kho_out.tree_lock);
+	if (err)
+		kfree(prop);
+	return err;
+}
+EXPORT_SYMBOL_GPL(kho_add_prop);
+
+/**
+ * kho_add_string_prop - add a string property to a node.
+ *
+ * See kho_add_prop() for details.
+ */
 int kho_add_string_prop(struct kho_node *node, const char *key, const char *val)
 {
 	return kho_add_prop(node, key, val, strlen(val) + 1);
 }
 EXPORT_SYMBOL_GPL(kho_add_string_prop);
 
+/**
+ * kho_remove_prop - add a property from a node.
+ * @node: KHO node to remove the property from.
+ * @key: key of the property.
+ * @size: if non-NULL, the property size is stored in it on success.
+ *
+ * Return: the pointer to the property value, or the following error,
+ *  - -EBUSY: KHO FDT has been finalized,
+ *  - -ENOENT: No property with @key is found.
+ */
 void *kho_remove_prop(struct kho_node *node, const char *key, u32 *size)
 {
-	return NULL;
+	struct kho_prop *p, *prop = NULL;
+	unsigned long key_hash;
+	void *ret = ERR_PTR(-ENOENT);
+
+	key_hash = strhash(key);
+
+	down_read(&kho_out.tree_lock);
+
+	if (kho_out.fdt) {
+		ret = ERR_PTR(-EBUSY);
+		goto out;
+	}
+
+	hash_for_each_possible(node->props, p, hlist, key_hash)
+		if (!strcmp(p->key, key)) {
+			prop = p;
+			break;
+		}
+
+	if (prop) {
+		ret = (void *)prop->val;
+		if (size)
+			*size = prop->size;
+		hash_del(&prop->hlist);
+		kfree(prop);
+	}
+
+out:
+	up_read(&kho_out.tree_lock);
+	return ret;
 }
+EXPORT_SYMBOL_GPL(kho_remove_prop);
 
 static int kho_out_update_debugfs_fdt(void)
 {
@@ -134,12 +361,131 @@ static int kho_out_update_debugfs_fdt(void)
 
 static int kho_unfreeze(void)
 {
+	int err;
+	void *fdt;
+
+	down_write(&kho_out.tree_lock);
+	fdt = kho_out.fdt;
+	kho_out.fdt = NULL;
+	up_write(&kho_out.tree_lock);
+
+	if (fdt)
+		kvfree(fdt);
+
+	err = blocking_notifier_call_chain(&kho_out.chain_head, KEXEC_KHO_UNFREEZE, NULL);
+	err = notifier_to_errno(err);
+
+	return notifier_to_errno(err);
+}
+
+static int kho_flatten_tree(void *fdt)
+{
+	int iter, err = 0;
+	struct kho_node *node, *sub_node;
+	struct list_head *ele;
+	struct kho_prop *prop;
+	LIST_HEAD(stack);
+
+	kho_out.root.visited = false;
+	list_add(&kho_out.root.list, &stack);
+
+	for (ele = stack.next; !list_is_head(ele, &stack); ele = stack.next) {
+		node = list_entry(ele, struct kho_node, list);
+
+		if (node->visited) {
+			err = fdt_end_node(fdt);
+			if (err)
+				return err;
+			list_del_init(ele);
+			continue;
+		}
+
+		err = fdt_begin_node(fdt, node->name);
+		if (err)
+			return err;
+
+		hash_for_each(node->props, iter, prop, hlist) {
+			err = fdt_property(fdt, prop->key, prop->val, prop->size);
+			if (err)
+				return err;
+		}
+
+		hash_for_each(node->nodes, iter, sub_node, hlist) {
+			sub_node->visited = false;
+			list_add(&sub_node->list, &stack);
+		}
+
+		node->visited = true;
+	}
+
+	return 0;
+}
+
+static int kho_convert_tree(void *buffer, int size)
+{
+	void *fdt = buffer;
+	int err = 0;
+
+	err = fdt_create(fdt, size);
+	if (err)
+		goto out;
+
+	err = fdt_finish_reservemap(fdt);
+	if (err)
+		goto out;
+
+	err = kho_flatten_tree(fdt);
+	if (err)
+		goto out;
+
+	err = fdt_finish(fdt);
+	if (err)
+		goto out;
+
+	err = fdt_check_header(fdt);
+	if (err)
+		goto out;
+
+out:
+	if (err) {
+		pr_err("failed to flatten state tree: %d\n", err);
+		return -EINVAL;
+	}
 	return 0;
 }
 
 static int kho_finalize(void)
 {
-	return 0;
+	int err = 0;
+	void *fdt;
+
+	fdt = kvmalloc(kho_out.dt_max, GFP_KERNEL);
+	if (!fdt)
+		return -ENOMEM;
+
+	err = blocking_notifier_call_chain(&kho_out.chain_head, KEXEC_KHO_FINALIZE, NULL);
+	err = notifier_to_errno(err);
+	if (err)
+		goto unfreeze;
+
+	down_write(&kho_out.tree_lock);
+	kho_out.fdt = fdt;
+	up_write(&kho_out.tree_lock);
+
+	err = kho_convert_tree(fdt, kho_out.dt_max);
+
+unfreeze:
+	if (err) {
+		int abort_err;
+
+		pr_err("Failed to convert KHO state tree: %d\n", err);
+
+		abort_err = kho_unfreeze();
+		if (abort_err)
+			pr_err("Failed to abort KHO state tree: %d\n", abort_err);
+	}
+
+	return err;
 }
 
 /* Handling for debug/kho/out */
@@ -272,6 +618,9 @@ static __init int kho_init(void)
 
 	if (!kho_enable)
 		return -EINVAL;
+
+	kho_out.root.name = "";
+	kho_add_string_prop(&kho_out.root, "compatible", "kho-v1");
 
 	debugfs_root = debugfs_create_dir("kho", NULL);
 	if (IS_ERR(debugfs_root))
