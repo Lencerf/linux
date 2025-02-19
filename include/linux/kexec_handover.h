@@ -34,6 +34,10 @@ struct kho_node {
 	bool visited;
 };
 
+struct kho_in_node {
+	int offset;
+};
+
 #ifdef CONFIG_KEXEC_HANDOVER
 bool kho_is_enabled(void);
 void kho_init_node(struct kho_node *node);
@@ -47,6 +51,17 @@ int register_kho_notifier(struct notifier_block *nb);
 int unregister_kho_notifier(struct notifier_block *nb);
 
 void kho_memory_init(void);
+
+void kho_populate(phys_addr_t dt_phys, phys_addr_t scratch_phys,
+		  u64 scratch_len);
+
+int kho_get_node(const struct kho_in_node *parent, const char* name, struct kho_in_node *child);
+int kho_get_nodes(const struct kho_in_node *parent, int (*func)(const char *, const struct kho_in_node *, void *), void *data);
+const void *kho_get_prop(const struct kho_in_node *node, const char *key, u32 *size);
+int kho_node_check_compatible(const struct kho_in_node *node, const char *compatible);
+
+void kho_return_mem(const struct kho_mem *mem);
+void *kho_claim_mem(const struct kho_mem *mem);
 #else
 static inline bool kho_is_enabled(void) { return false; }
 static inline void kho_init_node(struct kho_node *node) { }
@@ -74,6 +89,32 @@ static inline int unregister_kho_notifier(struct notifier_block *nb)
 }
 
 static inline void kho_memory_init(void) {}
+
+static inline void kho_populate(phys_addr_t dt_phys, phys_addr_t scratch_phys,
+				u64 scratch_len) {}
+
+static inline int kho_get_node(const struct kho_in_node *parent,
+			       const char* name, struct kho_in_node *child)
+{
+	return -ENOTSUPP;
+}
+static inline int kho_get_nodes(const struct kho_in_node *parent,
+				int (*func)(const char *, const struct kho_in_node *, void *), void *data)
+{
+	return -ENOTSUPP;
+}
+static inline const void *kho_get_prop(const struct kho_in_node *node,
+				       const char *key, u32 *size)
+{
+	return -ENOTSUPP;
+}
+static inline int kho_node_check_compatible(const struct kho_in_node *node, const char *compatible)
+{
+	return -ENOTSUPP;
+}
+
+static inline void kho_return_mem(const struct kho_mem *mem) { }
+static inline void *kho_claim_mem(const struct kho_mem *mem) { return NULL; }
 #endif /* CONFIG_KEXEC_HANDOVER */
 
 #endif /* LINUX_KEXEC_HANDOVER_H */
