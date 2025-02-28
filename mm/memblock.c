@@ -1837,6 +1837,34 @@ phys_addr_t __init_memblock memblock_reserved_size(void)
 	return memblock.reserved.total_size;
 }
 
+phys_addr_t __init_memblock memblock_reserved_kern_lowmem_size(void)
+{
+	struct memblock_region *r;
+	phys_addr_t total = 0;
+
+	for_each_reserved_mem_region(r) {
+		if ((r->flags & MEMBLOCK_RSRV_KERN) &&
+		    (r->base + r->size <= ARCH_LOW_ADDRESS_LIMIT))
+			total += r->size;
+	}
+
+	return total;
+}
+
+phys_addr_t __init_memblock memblock_reserved_kern_highmem_size(void)
+{
+	struct memblock_region *r;
+	phys_addr_t total = 0;
+
+	for_each_reserved_mem_region(r) {
+		if ((r->flags & MEMBLOCK_RSRV_KERN) &&
+		    (r->base + r->size > ARCH_LOW_ADDRESS_LIMIT))
+			total += r->size;
+	}
+
+	return total;
+}
+
 phys_addr_t __init_memblock memblock_reserved_kern_size(int nid)
 {
 	struct memblock_region *r;

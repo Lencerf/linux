@@ -547,20 +547,21 @@ late_initcall(kho_init);
  *
  * kho_scratch=N%
  *
- * It is also possible to explicitly define size for a global and per-node
- * scratch areas:
+ * It is also possible to explicitly define size for a lowmem, a global and
+ * per-node scratch areas:
  *
- * kho_scratch=n[KMG],m[KMG]
+ * kho_scratch=l[KMG],n[KMG],m[KMG]
  *
  * The explicit size definition takes precedence over scale definition.
  */
 static unsigned int scratch_scale __initdata = 200;
 static phys_addr_t scratch_size_global __initdata;
 static phys_addr_t scratch_size_pernode __initdata;
+static phys_addr_t scratch_size_lowmem __initdata;
 
 static int __init kho_parse_scratch_size(char *p)
 {
-	unsigned long size, size_pernode;
+	unsigned long size, size_pernode, size_global;
 	char *endptr, *oldp = p;
 
 	if (!p)
@@ -578,15 +579,25 @@ static int __init kho_parse_scratch_size(char *p)
 		if (*p != ',')
 			return -EINVAL;
 
+		oldp = p;
+		size_global = memparse(p + 1, &p);
+		if (!size_global || p == oldp)
+			return -EINVAL;
+
+		if (*p != ',')
+			return -EINVAL;
+
 		size_pernode = memparse(p + 1, &p);
 		if (!size_pernode)
 			return -EINVAL;
 
-		scratch_size_global = size;
+		scratch_size_lowmem = size;
+		scratch_size_global = size_global;
 		scratch_size_pernode = size_pernode;
 		scratch_scale = 0;
 
-		pr_notice("scratch areas: global: %lluMB pernode: %lldMB\n",
+		pr_notice("scratch areas: lowmem: %lluMB global: %lluMB pernode: %lldMB\n",
+			  (u64)(scratch_size_lowmem >> 20),
 			  (u64)(scratch_size_global >> 20),
 			  (u64)(scratch_size_pernode >> 20));
 	}
@@ -595,18 +606,38 @@ static int __init kho_parse_scratch_size(char *p)
 }
 early_param("kho_scratch", kho_parse_scratch_size);
 
-static phys_addr_t __init scratch_size(int nid)
+static phys_addr_t __init scratch_size_low(void)
 {
 	phys_addr_t size;
 
-	if (scratch_scale) {
+	if (scratch_scale)
+		size = memblock_reserved_kern_lowmem_size() * scratch_scale / 100;
+	else
+		size = scratch_size_lowmem;
+
+	return round_up(size, CMA_MIN_ALIGNMENT_BYTES);
+}
+
+static phys_addr_t __init scratch_size_high(void)
+{
+	phys_addr_t size;
+
+	if (scratch_scale)
+		size = memblock_reserved_kern_highmem_size() * scratch_scale / 100;
+	else
+		size = scratch_size_global;
+
+	return round_up(size, CMA_MIN_ALIGNMENT_BYTES);
+}
+
+static phys_addr_t __init scratch_size_node(int nid)
+{
+	phys_addr_t size;
+
+	if (scratch_scale)
 		size = memblock_reserved_kern_size(nid) * scratch_scale / 100;
-	} else {
-		if (numa_valid_node(nid))
-			size = scratch_size_pernode;
-		else
-			size = scratch_size_global;
-	}
+	else
+		size = scratch_size_pernode;
 
 	return round_up(size, CMA_MIN_ALIGNMENT_BYTES);
 }
@@ -623,29 +654,41 @@ static phys_addr_t __init scratch_size(int nid)
 static void kho_reserve_scratch(void)
 {
 	phys_addr_t addr, size;
-	int nid, i = 1;
+	int nid, i = 0;
 
 	if (!kho_enable)
 		return;
 
 	/* FIXME: deal with node hot-plug/remove */
-	kho_scratch_cnt = num_online_nodes() + 1;
+	kho_scratch_cnt = num_online_nodes() + 2;
 	size = kho_scratch_cnt * sizeof(*kho_scratch);
 	kho_scratch = memblock_alloc(size, PAGE_SIZE);
 	if (!kho_scratch)
 		goto err_disable_kho;
 
-	/* reserve large contiguous area for allocations without nid */
-	size = scratch_size(NUMA_NO_NODE);
-	addr = memblock_phys_alloc(size, CMA_MIN_ALIGNMENT_BYTES);
+	/* reserve area for lowmem allocations. */
+	size = scratch_size_low();
+	addr = memblock_phys_alloc_range(size, CMA_MIN_ALIGNMENT_BYTES, 0,
+					 ARCH_LOW_ADDRESS_LIMIT);
 	if (!addr)
 		goto err_free_scratch_desc;
 
 	kho_scratch[0].addr = addr;
 	kho_scratch[0].size = size;
+	i++;
+
+	/* reserve large contiguous area for allocations without nid */
+	size = scratch_size_high();
+	addr = memblock_phys_alloc(size, CMA_MIN_ALIGNMENT_BYTES);
+	if (!addr)
+		goto err_free_scratch_areas;
+
+	kho_scratch[1].addr = addr;
+	kho_scratch[1].size = size;
+	i++;
 
 	for_each_online_node(nid) {
-		size = scratch_size(nid);
+		size = scratch_size_node(nid);
 		addr = memblock_alloc_range_nid(size, CMA_MIN_ALIGNMENT_BYTES,
 						0, MEMBLOCK_ALLOC_ACCESSIBLE,
 						nid, true);

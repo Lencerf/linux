@@ -19,11 +19,11 @@ at compile time. Every KHO producer may have its own config option that you
 need to enable if you would like to preserve their respective state across
 kexec.
 
-To use KHO, please boot the kernel with the ``kho=on`` command line
-parameter. You may use ``kho_scratch`` parameter to define size of the
-scratch regions. For example ``kho_scratch=512M,512M`` will reserve a 512
-MiB for a global scratch region and 512 MiB per NUMA node scratch regions
-on boot.
+To use KHO, please boot the kernel with the ``kho=on`` command line parameter.
+You may use ``kho_scratch`` parameter to define size of the scratch regions. For
+example ``kho_scratch=128M,512M,512M`` will reserve a 128 MiB low memory scratch
+region, a 512 MiB global scratch region and 512 MiB per NUMA node scratch
+regions on boot.
 
 Perform a KHO kexec
 -------------------
