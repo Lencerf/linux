@@ -205,6 +205,12 @@ extern int shmem_mfill_atomic_pte(pmd_t *dst_pmd,
 #endif /* CONFIG_SHMEM */
 #endif /* CONFIG_USERFAULTFD */
 
+#if defined(CONFIG_FDBOX) && defined(CONFIG_KEXEC_HANDOVER)
+bool is_node_shmem(const void *fdt, int offset);
+int shmem_fdbox_kho_write(struct fdbox_fd *ffd, void *fdt);
+struct file *shmem_fdbox_kho_recover(const void *fdt, int offset);
+#endif
+
 /*
  * Used space is stored as unsigned 64-bit value in bytes but
  * quota core supports only signed 64-bit values so use that
