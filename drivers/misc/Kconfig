@@ -632,6 +632,13 @@ config MCHP_LAN966X_PCI
 	    - lan966x-miim (MDIO_MSCC_MIIM)
 	    - lan966x-switch (LAN966X_SWITCH)
 
+config FDBOX
+	bool "File Descriptor Box device to persist fds"
+	help
+	  Add a new /dev/fdbox directory that allows user space to preserve specific
+	  types of file descritors when user space exits. Also preserves the same
+	  types of file descriptors across kexec when KHO is enabled.
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

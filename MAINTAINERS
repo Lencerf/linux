@@ -8862,6 +8862,14 @@ F:	include/scsi/libfc.h
 F:	include/scsi/libfcoe.h
 F:	include/uapi/scsi/fc/
 
+FDBOX
+M:	Pratyush Yadav <pratyush@kernel.org>
+L:	linux-fsdevel@vger.kernel.org
+S:	Maintained
+F:	drivers/misc/fdbox.c
+F:	include/linux/fdbox.h
+F:	include/uapi/linux/fdbox.h
+
 FILE LOCKING (flock() and fcntl()/lockf())
 M:	Jeff Layton <jlayton@kernel.org>
 M:	Chuck Lever <chuck.lever@oracle.com>

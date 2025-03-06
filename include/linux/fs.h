@@ -81,6 +81,9 @@ struct fs_context;
 struct fs_parameter_spec;
 struct fileattr;
 struct iomap_ops;
+struct fdbox;
+struct fdbox_fd;
+struct fdbox_file_ops;
 
 extern void __init inode_init(void);
 extern void __init inode_init_early(void);
@@ -1078,6 +1081,7 @@ static inline int ra_has_index(struct file_ra_state *ra, pgoff_t index)
  * @f_llist: work queue entrypoint
  * @f_ra: file's readahead state
  * @f_freeptr: Pointer used by SLAB_TYPESAFE_BY_RCU file cache (don't touch.)
+ * @f_fdbox_op: FDBOX operations
  */
 struct file {
 	file_ref_t			f_ref;
@@ -1116,6 +1120,9 @@ struct file {
 		freeptr_t		f_freeptr;
 	};
 	/* --- cacheline 3 boundary (192 bytes) --- */
+#ifdef CONFIG_FDBOX
+	const struct fdbox_file_ops	*f_fdbox_op;
+#endif
 } __randomize_layout
   __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
 
