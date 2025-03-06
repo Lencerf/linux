@@ -7,6 +7,8 @@
  * This file is released under the GPL.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/fs.h>
 #include <linux/vfs.h>
 #include <linux/pagemap.h>
@@ -19,7 +21,11 @@
 #include <linux/shmem_fs.h>
 #include <linux/memfd.h>
 #include <linux/pid_namespace.h>
+#include <linux/fdbox.h>
+#include <linux/libfdt.h>
 #include <uapi/linux/memfd.h>
+
+static const struct fdbox_file_ops memfd_fdbox_fops;
 
 /*
  * We need a tag: a new tag would expand every xa_node by 8 bytes,
@@ -418,21 +424,10 @@ err_name:
 	return ERR_PTR(error);
 }
 
-static struct file *alloc_file(const char *name, unsigned int flags)
+static void memfd_setup_file(struct file *file, unsigned int flags)
 {
 	unsigned int *file_seals;
-	struct file *file;
 
-	if (flags & MFD_HUGETLB) {
-		file = hugetlb_file_setup(name, 0, VM_NORESERVE,
-					HUGETLB_ANONHUGE_INODE,
-					(flags >> MFD_HUGE_SHIFT) &
-					MFD_HUGE_MASK);
-	} else {
-		file = shmem_file_setup(name, 0, VM_NORESERVE);
-	}
-	if (IS_ERR(file))
-		return file;
 	file->f_mode |= FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
 	file->f_flags |= O_LARGEFILE;
 
@@ -452,6 +447,27 @@ static struct file *alloc_file(const char *name, unsigned int flags)
 			*file_seals &= ~F_SEAL_SEAL;
 	}
 
+#if defined(CONFIG_FDBOX) && defined(CONFIG_KEXEC_HANDOVER)
+	file->f_fdbox_op = &memfd_fdbox_fops;
+#endif
+}
+
+static struct file *alloc_file(const char *name, unsigned int flags)
+{
+	struct file *file;
+
+	if (flags & MFD_HUGETLB) {
+		file = hugetlb_file_setup(name, 0, VM_NORESERVE,
+					  HUGETLB_ANONHUGE_INODE,
+					  (flags >> MFD_HUGE_SHIFT) &
+					  MFD_HUGE_MASK);
+	} else {
+		file = shmem_file_setup(name, 0, VM_NORESERVE);
+	}
+	if (IS_ERR(file))
+		return file;
+
+	memfd_setup_file(file, flags);
 	return file;
 }
 
@@ -493,3 +509,91 @@ err_name:
 	kfree(name);
 	return error;
 }
+
+#if defined(CONFIG_FDBOX) && defined(CONFIG_KEXEC_HANDOVER)
+static const char memfd_fdbox_compatible[] = "fdbox,memfd-v1";
+
+static struct file *memfd_fdbox_kho_recover(const void *fdt, int offset)
+{
+	struct file *file;
+	int ret, subnode;
+
+	ret = fdt_node_check_compatible(fdt, offset, memfd_fdbox_compatible);
+	if (ret) {
+		pr_err("kho: invalid compatible\n");
+		return NULL;
+	}
+
+	/* Make sure there is exactly one subnode. */
+	subnode = fdt_first_subnode(fdt, offset);
+	if (subnode < 0) {
+		pr_err("kho: no subnode for underlying storage found!\n");
+		return NULL;
+	}
+	if (fdt_next_subnode(fdt, subnode) >= 0) {
+		pr_err("kho: too many subnodes. Expected only 1.\n");
+		return NULL;
+	}
+
+	if (is_node_shmem(fdt, subnode)) {
+		file = shmem_fdbox_kho_recover(fdt, subnode);
+		if (!file)
+			return NULL;
+
+		memfd_setup_file(file, 0);
+		return file;
+	}
+
+	return NULL;
+}
+
+static int memfd_fdbox_kho_write(struct fdbox_fd *box_fd, void *fdt)
+{
+	int ret = 0;
+
+	ret |= fdt_property(fdt, "compatible", memfd_fdbox_compatible,
+			    sizeof(memfd_fdbox_compatible));
+
+	/* TODO: Track seals on the file as well. */
+
+	ret |= fdt_begin_node(fdt, "");
+	if (ret) {
+		pr_err("kho: failed to set up memfd node\n");
+		return -EINVAL;
+	}
+
+	if (shmem_file(box_fd->file))
+		ret = shmem_fdbox_kho_write(box_fd, fdt);
+	else
+		/* TODO: HugeTLB support. */
+		ret = -EOPNOTSUPP;
+
+	if (ret)
+		return ret;
+
+	ret = fdt_end_node(fdt);
+	if (ret) {
+		pr_err("kho: failed to end memfd node!\n");
+		return ret;
+	}
+
+	return 0;
+}
+
+static const struct fdbox_file_ops memfd_fdbox_fops = {
+	.kho_write = memfd_fdbox_kho_write,
+};
+
+static int __init memfd_fdbox_init(void)
+{
+	int error;
+
+	error = fdbox_register_handler(memfd_fdbox_compatible,
+				       memfd_fdbox_kho_recover);
+	if (error)
+		pr_err("Could not register fdbox handler: %d\n", error);
+
+	return 0;
+}
+late_initcall(memfd_fdbox_init);
+#endif /* CONFIG_FDBOX && CONFIG_KEXEC_HANDOVER */
