@@ -1077,12 +1077,56 @@ static struct folio *shmem_get_partial_folio(struct inode *inode, pgoff_t index)
 	return folio;
 }
 
+struct shmem_undo_range_ops {
+	/* Return -ve on error, or number of entries freed. */
+	long (*undo_swap)(struct address_space *mapping, pgoff_t index,
+			  void *old, void *arg);
+	/* Return -ve on error, 0 on success. */
+	int (*undo_folio)(struct address_space *mapping, struct folio *folio,
+			  void *arg);
+	/*
+	 * Return -ve on error, 0 if splitting failed, 1 if splitting succeeded.
+	 */
+	int (*undo_partial_folio)(struct folio *folio, pgoff_t lstart,
+				  pgoff_t lend, void *arg);
+};
+
+static long shmem_default_undo_swap(struct address_space *mapping, pgoff_t index,
+				    void *old, void *arg)
+{
+	return shmem_free_swap(mapping, index, old);
+}
+
+static int shmem_default_undo_folio(struct address_space *mapping,
+				    struct folio *folio, void *arg)
+{
+	truncate_inode_folio(mapping, folio);
+	return 0;
+}
+
+static int shmem_default_undo_partial_folio(struct folio *folio, pgoff_t lstart,
+					    pgoff_t lend, void *arg)
+{
+	/*
+	 * Function returns bool. Convert it to int and return. No error
+	 * returns needed here.
+	 */
+	return truncate_inode_partial_folio(folio, lstart, lend);
+}
+
+static const struct shmem_undo_range_ops shmem_default_undo_ops = {
+	.undo_swap = shmem_default_undo_swap,
+	.undo_folio = shmem_default_undo_folio,
+	.undo_partial_folio = shmem_default_undo_partial_folio,
+};
+
 /*
  * Remove range of pages and swap entries from page cache, and free them.
  * If !unfalloc, truncate or punch hole; if unfalloc, undo failed fallocate.
  */
-static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
-								 bool unfalloc)
+static int shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+			    bool unfalloc,
+			    const struct shmem_undo_range_ops *ops, void *arg)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct shmem_inode_info *info = SHMEM_I(inode);
@@ -1094,7 +1138,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 	bool same_folio;
 	long nr_swaps_freed = 0;
 	pgoff_t index;
-	int i;
+	int i, ret = 0;
 
 	if (lend == -1)
 		end = -1;	/* unsigned, so actually very big */
@@ -1112,17 +1156,31 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 			if (xa_is_value(folio)) {
 				if (unfalloc)
 					continue;
-				nr_swaps_freed += shmem_free_swap(mapping,
-							indices[i], folio);
+
+				ret = ops->undo_swap(mapping, indices[i], folio,
+						     arg);
+				if (ret < 0) {
+					folio_unlock(folio);
+					break;
+				}
+
+				nr_swaps_freed += ret;
 				continue;
 			}
 
-			if (!unfalloc || !folio_test_uptodate(folio))
-				truncate_inode_folio(mapping, folio);
+			if (!unfalloc || !folio_test_uptodate(folio)) {
+				ret = ops->undo_folio(mapping, folio, arg);
+				if (ret < 0) {
+					folio_unlock(folio);
+					break;
+				}
+			}
 			folio_unlock(folio);
 		}
 		folio_batch_remove_exceptionals(&fbatch);
 		folio_batch_release(&fbatch);
+		if (ret < 0)
+			goto out;
 		cond_resched();
 	}
 
@@ -1140,7 +1198,13 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 	if (folio) {
 		same_folio = lend < folio_pos(folio) + folio_size(folio);
 		folio_mark_dirty(folio);
-		if (!truncate_inode_partial_folio(folio, lstart, lend)) {
+		ret = ops->undo_partial_folio(folio, lstart, lend, arg);
+		if (ret < 0) {
+			folio_unlock(folio);
+			folio_put(folio);
+			goto out;
+		}
+		if (ret == 0) {
 			start = folio_next_index(folio);
 			if (same_folio)
 				end = folio->index;
@@ -1154,7 +1218,14 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
 		folio = shmem_get_partial_folio(inode, lend >> PAGE_SHIFT);
 	if (folio) {
 		folio_mark_dirty(folio);
-		if (!truncate_inode_partial_folio(folio, lstart, lend))
+		ret = ops->undo_partial_folio(folio, lstart, lend, arg);
+		if (ret < 0) {
+			folio_unlock(folio);
+			folio_put(folio);
+			goto out;
+		}
+
+		if (ret == 0)
 			end = folio->index;
 		folio_unlock(folio);
 		folio_put(folio);
@@ -1179,18 +1250,21 @@ whole_folios:
 			folio = fbatch.folios[i];
 
 			if (xa_is_value(folio)) {
-				long swaps_freed;
-
 				if (unfalloc)
 					continue;
-				swaps_freed = shmem_free_swap(mapping, indices[i], folio);
-				if (!swaps_freed) {
+
+				ret = ops->undo_swap(mapping, indices[i], folio,
+						     arg);
+				if (ret < 0) {
+					break;
+				} else if (ret == 0) {
 					/* Swap was replaced by page: retry */
 					index = indices[i];
 					break;
+				} else {
+					nr_swaps_freed += ret;
+					continue;
 				}
-				nr_swaps_freed += swaps_freed;
-				continue;
 			}
 
 			folio_lock(folio);
@@ -1206,20 +1280,33 @@ whole_folios:
 						folio);
 
 				if (!folio_test_large(folio)) {
-					truncate_inode_folio(mapping, folio);
-				} else if (truncate_inode_partial_folio(folio, lstart, lend)) {
-					/*
-					 * If we split a page, reset the loop so
-					 * that we pick up the new sub pages.
-					 * Otherwise the THP was entirely
-					 * dropped or the target range was
-					 * zeroed, so just continue the loop as
-					 * is.
-					 */
-					if (!folio_test_large(folio)) {
+					ret = ops->undo_folio(mapping, folio,
+							      arg);
+					if (ret < 0) {
 						folio_unlock(folio);
-						index = start;
 						break;
+					}
+				} else {
+					ret = ops->undo_partial_folio(folio, lstart, lend, arg);
+					if (ret < 0) {
+						folio_unlock(folio);
+						break;
+					}
+
+					if (ret) {
+						/*
+						 * If we split a page, reset the loop so
+						 * that we pick up the new sub pages.
+						 * Otherwise the THP was entirely
+						 * dropped or the target range was
+						 * zeroed, so just continue the loop as
+						 * is.
+						 */
+						if (!folio_test_large(folio)) {
+							folio_unlock(folio);
+							index = start;
+							break;
+						}
 					}
 				}
 			}
@@ -1227,14 +1314,24 @@ whole_folios:
 		}
 		folio_batch_remove_exceptionals(&fbatch);
 		folio_batch_release(&fbatch);
+		if (ret < 0)
+			goto out;
 	}
 
+	ret = 0;
+out:
 	shmem_recalc_inode(inode, 0, -nr_swaps_freed);
+	return ret;
 }
 
 void shmem_truncate_range(struct inode *inode, loff_t lstart, loff_t lend)
 {
-	shmem_undo_range(inode, lstart, lend, false);
+	int ret;
+
+	ret = shmem_undo_range(inode, lstart, lend, false,
+			       &shmem_default_undo_ops, NULL);
+
+	WARN(ret < 0, "shmem_undo_range() should never fail with default ops");
 	inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
 	inode_inc_iversion(inode);
 }
@@ -3750,9 +3847,15 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 			info->fallocend = undo_fallocend;
 			/* Remove the !uptodate folios we added */
 			if (index > start) {
-				shmem_undo_range(inode,
-				    (loff_t)start << PAGE_SHIFT,
-				    ((loff_t)index << PAGE_SHIFT) - 1, true);
+				int ret;
+
+				ret = shmem_undo_range(inode,
+						       (loff_t)start << PAGE_SHIFT,
+						       ((loff_t)index << PAGE_SHIFT) - 1,
+						       true,
+						       &shmem_default_undo_ops,
+						       NULL);
+				WARN(ret < 0, "shmem_undo_range() should never fail with default ops");
 			}
 			goto undone;
 		}
