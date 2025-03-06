@@ -685,13 +685,15 @@ static void kho_init_reserved_pages(void)
 	     offset >= 0 && depth >= initial_depth;
 	     offset = fdt_next_node(fdt, offset, &depth)) {
 		const struct kho_mem *mems;
-		u32 i;
+		u32 i, nr_mems;
 
 		mems = fdt_getprop(fdt, offset, "mem", &len);
 		if (!mems || len & (sizeof(*mems) - 1))
 			continue;
 
-		for (i = 0; i < len; i += sizeof(*mems)) {
+		nr_mems = len / sizeof(*mems);
+
+		for (i = 0; i < nr_mems; i++) {
 			const struct kho_mem *mem = &mems[i];
 
 			memblock_reserve(mem->addr, mem->size);
