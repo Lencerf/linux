@@ -607,6 +607,27 @@ used. To block changes to file contents via a memory mapping during the
 operation, the filesystem must take mapping->invalidate_lock to coordinate
 with ->page_mkwrite.
 
+fdbox_file_ops
+==============
+
+prototypes::
+
+	int (*kho_write)(struct fdbox_fd *box_fd, void *fdt);
+	int (*seal)(struct fdbox *box);
+	int (*unseal)(struct fdbox *box);
+
+
+locking rules:
+	all may block
+
+==============	==================================================
+ops		i_rwsem(box_fd->file->f_inode)
+==============	==================================================
+kho_write:	exclusive
+seal:		no
+unseal:		no
+==============	==================================================
+
 dquot_operations
 ================
 

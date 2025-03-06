@@ -1,5 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0-or-later
 
+.. _kho:
+
 ========================
 Kexec Handover Subsystem
 ========================
@@ -9,6 +11,7 @@ Kexec Handover Subsystem
 
    concepts
    usage
+   fdbox
 
 .. only::  subproject and html
 

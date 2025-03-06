@@ -8866,6 +8866,7 @@ FDBOX
 M:	Pratyush Yadav <pratyush@kernel.org>
 L:	linux-fsdevel@vger.kernel.org
 S:	Maintained
+F:	Documentation/kho/fdbox.rst
 F:	drivers/misc/fdbox.c
 F:	include/linux/fdbox.h
 F:	include/uapi/linux/fdbox.h
