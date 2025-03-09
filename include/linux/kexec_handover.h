@@ -49,6 +49,7 @@ int kho_add_prop(struct kho_node *node, const char *key, const void *val, u32 si
 void *kho_remove_prop(struct kho_node *node, const char *key, u32 *size);
 int kho_add_string_prop(struct kho_node *node, const char *key, const char *val);
 
+int kho_preserve_folio(void *virt);
 int register_kho_notifier(struct notifier_block *nb);
 int unregister_kho_notifier(struct notifier_block *nb);
 

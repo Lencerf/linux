@@ -170,7 +170,7 @@ static int demo_kho_notifier_finalize(void) {
 	size_t pages_count = 0;
 	size_t names_total_size = 0;
 	struct list_head *pos;
-	struct kho_mem *mems;
+	phys_addr_t *addresses;
 	char *names_buffer;
 	int iter = 0;
 	int name_offset = 0;
@@ -186,9 +186,9 @@ static int demo_kho_notifier_finalize(void) {
 	names_total_size += 1;
 	/* String list property size must be 4-byte aligned. */
 	names_total_size = (names_total_size + 3) & ~3;
-	mems = kvmalloc_array(pages_count, sizeof(struct kho_mem), GFP_KERNEL);
+	addresses = kvmalloc_array(pages_count, sizeof(phys_addr_t), GFP_KERNEL);
 	names_buffer = kzalloc(names_total_size, GFP_KERNEL);
-	if (!(mems && names_buffer)) {
+	if (!(addresses && names_buffer)) {
 		pr_err("failed to allocate temp buffer");
 		return NOTIFY_BAD;
 	}
@@ -196,10 +196,8 @@ static int demo_kho_notifier_finalize(void) {
 	list_for_each(pos, &named_pages) {
 		struct named_page *p = container_of(pos, struct named_page, list);
 
-		mems[iter] = (struct kho_mem){
-			.addr = __pa(p->buf),
-			.size = PAGE_SIZE,
-		};
+		kho_preserve_folio(p->buf);
+		addresses[iter] = __pa(p->buf);
 		size_t name_len = strlen(p->attr.attr.name);
 
 		memcpy(names_buffer + name_offset, p->attr.attr.name, name_len);
@@ -208,7 +206,7 @@ static int demo_kho_notifier_finalize(void) {
 		iter += 1;
 	}
 
-	kho_add_prop(&named_pages_node, "mem", mems, sizeof(struct kho_mem) * pages_count);
+	kho_add_prop(&named_pages_node, "addresses", addresses, sizeof(phys_addr_t) * pages_count);
 	kho_add_prop(&named_pages_node, "names", names_buffer, names_total_size);
 
 	return NOTIFY_DONE;
@@ -251,7 +249,7 @@ static int restore_from_kho(void)
 	const void *p;
 	int pages_size = 0;
 	int names_size = 0;
-	const struct kho_mem *mems;
+	const phys_addr_t *addresses;
 	const char *names;
 	const char *p_name;
 
@@ -281,15 +279,19 @@ static int restore_from_kho(void)
 		goto reset_small_param;
 	}
 
-	mems = (struct kho_mem *)fdt_getprop(fdt, offset, "mem", &pages_size);
+	addresses = (phys_addr_t *)fdt_getprop(fdt, offset, "addresses", &pages_size);
 	names = (char *)fdt_getprop(fdt, offset, "names", &names_size);
-	if (!(mems && names)) {
-		pr_err("cannot find both `mem` and `names` in /khodemo/named_pages");
+	if (!(addresses && names)) {
+		pr_err("cannot find both `addresses` and `names` in /khodemo/named_pages");
 		err = -ENOENT;
 		goto reset_small_param;
 	}
-	for (p_name = names; i < pages_size / sizeof(struct kho_mem); i += 1) {
-		char *buf = kho_claim_mem(&mems[i]);
+	for (p_name = names; i < pages_size / sizeof(phys_addr_t); i += 1) {
+		struct kho_mem mem = {
+			.addr = addresses[i],
+			.size = PAGE_SIZE,
+		};
+		char *buf = kho_claim_mem(&mem);
 		size_t name_len = strlen(p_name);
 		char *name = kmalloc(name_len + 1, GFP_KERNEL);
 
