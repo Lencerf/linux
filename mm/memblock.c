@@ -17,6 +17,10 @@
 #include <linux/seq_file.h>
 #include <linux/memblock.h>
 
+#ifdef CONFIG_KEXEC_HANDOVER
+#include <linux/kexec_handover.h>
+#endif /* CONFIG_KEXEC_HANDOVER */
+
 #include <asm/sections.h>
 #include <linux/io.h>
 
@@ -2431,6 +2435,158 @@ int reserve_mem_find_by_name(const char *name, phys_addr_t *start, phys_addr_t *
 }
 EXPORT_SYMBOL_GPL(reserve_mem_find_by_name);
 
+#ifdef CONFIG_KEXEC_HANDOVER
+#define MEMBLOCK_KHO_NODE "memblock"
+#define MEMBLOCK_KHO_NODE_COMPATIBLE "memblock-v1"
+#define RESERVE_MEM_KHO_NODE_COMPATIBLE "reserve-mem-v1"
+static struct kho_fdt kho_fdt;
+
+static int reserve_mem_kho_finalize(struct kho_serialization *ser)
+{
+	int err = 0, i;
+
+	err = kho_validate_fdt(&kho_fdt);
+	if (err) {
+		pr_err("memblock FDT is not valid: %d\n", err);
+		return NOTIFY_STOP;
+	}
+
+	for (i = 0; i < reserved_mem_count; i++) {
+		struct reserve_mem_table *map = &reserved_mem_table[i];
+
+		err |= kho_preserve_phys(ser->tracker, map->start, map->size);
+	}
+	err |= kho_preserve_fdt(ser->tracker, &kho_fdt);
+
+	err |= kho_link_fdt(ser->fdt, "memblock", &kho_fdt);
+
+	return err ? NOTIFY_STOP : NOTIFY_DONE;
+}
+
+static int reserve_mem_kho_notifier(struct notifier_block *self,
+				    unsigned long cmd, void *v)
+{
+	switch (cmd) {
+	case KEXEC_KHO_FINALIZE:
+		return reserve_mem_kho_finalize((struct kho_serialization *)v);
+	case KEXEC_KHO_ABORT:
+		return NOTIFY_DONE;
+	default:
+		return NOTIFY_BAD;
+	}
+}
+
+static struct notifier_block reserve_mem_kho_nb = {
+	.notifier_call = reserve_mem_kho_notifier,
+};
+
+static int __init prepare_kho_fdt(void)
+{
+	int err = 0, i;
+	void *fdt = &kho_fdt;
+
+	err = kho_new_fdt(fdt);
+	if (err)
+		return err;
+
+	err |= kho_begin_node(fdt, "");
+	err |= kho_add_string_prop(fdt, "compatible", MEMBLOCK_KHO_NODE_COMPATIBLE);
+
+	for (i = 0; i < reserved_mem_count; i++) {
+		struct reserve_mem_table *map = &reserved_mem_table[i];
+
+		err |= kho_begin_node(fdt, map->name);
+		err |= kho_add_string_prop(fdt, "compatible", RESERVE_MEM_KHO_NODE_COMPATIBLE);
+		err |= kho_add_prop(fdt, "start", &map->start, sizeof(map->start));
+		err |= kho_add_prop(fdt, "size", &map->size, sizeof(map->size));
+		err |= kho_end_node(fdt);
+	}
+	err |= kho_end_node(fdt);
+
+	err |= kho_finish_fdt(fdt);
+
+	if (err) {
+		pr_err("failed to prepare memblock FDT for KHO: %d\n", err);
+		kho_free_fdt(fdt);
+	}
+	return err;
+}
+
+static int __init reserve_mem_init(void)
+{
+	if (!kho_is_enabled())
+		return 0;
+
+	WARN_ON(prepare_kho_fdt());
+
+	return register_kho_notifier(&reserve_mem_kho_nb);
+}
+late_initcall(reserve_mem_init);
+
+static bool __init reserve_mem_kho_revive(const char *name, phys_addr_t size,
+					  phys_addr_t align)
+{
+	int err, len_start, len_size;
+	struct kho_node node, child;
+	const phys_addr_t *p_start, *p_size;
+
+	err = kho_retrieve_node(NULL, MEMBLOCK_KHO_NODE, &node);
+	if (err)
+		return false;
+
+	err = kho_node_check_compatible(&node, MEMBLOCK_KHO_NODE_COMPATIBLE);
+	if (err) {
+		pr_warn("Node '%s' is incompatible with %s: %d\n",
+			MEMBLOCK_KHO_NODE, MEMBLOCK_KHO_NODE_COMPATIBLE, err);
+		return false;
+	}
+
+	err = kho_retrieve_node(&node, name, &child);
+	if (err) {
+		pr_warn("Node '%s' has no child '%s': %d\n",
+			MEMBLOCK_KHO_NODE, name, err);
+		return false;
+	}
+	err = kho_node_check_compatible(&child, RESERVE_MEM_KHO_NODE_COMPATIBLE);
+	if (err) {
+		pr_warn("Node '%s/%s' is incompatible with %s: %d\n",
+			MEMBLOCK_KHO_NODE, name,
+			RESERVE_MEM_KHO_NODE_COMPATIBLE, err);
+		return false;
+	}
+
+	p_start = kho_retrieve_prop(&child, "start", &len_start);
+	p_size = kho_retrieve_prop(&child, "size", &len_size);
+	if (!p_start || len_start != sizeof(*p_start) || !p_size ||
+	    len_size != sizeof(*p_size)) {
+		return false;
+	}
+
+	if (*p_start & (align - 1)) {
+		pr_warn("KHO reserve-mem '%s' has wrong alignment (0x%lx, 0x%lx)\n",
+			name, (long)align, (long)*p_start);
+		return false;
+	}
+
+	if (*p_size != size) {
+		pr_warn("KHO reserve-mem '%s' has wrong size (0x%lx != 0x%lx)\n",
+			name, (long)*p_size, (long)size);
+		return false;
+	}
+
+	reserved_mem_add(*p_start, size, name);
+	pr_info("Revived memory reservation '%s' from KHO\n", name);
+
+	return true;
+}
+#else
+static bool __init reserve_mem_kho_revive(const char *name, phys_addr_t size,
+					  phys_addr_t align)
+{
+	return false;
+}
+#endif /* CONFIG_KEXEC_HANDOVER */
+
 /*
  * Parse reserve_mem=nn:align:name
  */
@@ -2486,6 +2642,11 @@ static int __init reserve_mem(char *p)
 	if (reserve_mem_find_by_name(name, &start, &tmp))
 		return -EBUSY;
 
+	/* Pick previous allocations up from KHO if available */
+	if (reserve_mem_kho_revive(name, size, align))
+		return 1;
+
+	/* TODO: Allocation must be outside of scratch region */
 	start = memblock_phys_alloc(size, align);
 	if (!start)
 		return -ENOMEM;
