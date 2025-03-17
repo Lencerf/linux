@@ -16,6 +16,24 @@ enum kho_event {
 };
 
 struct notifier_block;
+struct folio;
+
+#define DECLARE_KHOSER_PTR(name, type) \
+	union {                        \
+		phys_addr_t phys;      \
+		type ptr;              \
+	} name
+#define KHOSER_STORE_PTR(dest, val)               \
+	({                                        \
+		typeof(val) v = val;              \
+		typecheck(typeof((dest).ptr), v); \
+		(dest).phys = virt_to_phys(v);    \
+	})
+#define KHOSER_LOAD_PTR(src)                                                 \
+	({                                                                   \
+		typeof(src) s = src;                                         \
+		(typeof((s).ptr))((s).phys ? phys_to_virt((s).phys) : NULL); \
+	})
 
 struct kho_serialization;
 
@@ -26,6 +44,12 @@ int kho_add_fdt(struct kho_serialization *ser, const char *name, void *fdt);
 
 int register_kho_notifier(struct notifier_block *nb);
 int unregister_kho_notifier(struct notifier_block *nb);
+
+int kho_preserve_folio(struct kho_serialization *ser, struct folio *folio);
+int kho_preserve_phys(struct kho_serialization *ser, phys_addr_t phys,
+		      size_t size);
+struct folio *kho_restore_folio(phys_addr_t phys);
+void *kho_restore_phys(phys_addr_t phys, size_t size);
 
 void kho_memory_init(void);
 #else
@@ -48,6 +72,28 @@ static inline int register_kho_notifier(struct notifier_block *nb)
 static inline int unregister_kho_notifier(struct notifier_block *nb)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int kho_preserve_folio(struct kho_serialization *ser,
+				     struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_preserve_phys(struct kho_serialization *ser,
+				    phys_addr_t phys, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline struct folio *kho_restore_folio(phys_addr_t phys)
+{
+	return NULL;
+}
+
+static inline void *kho_restore_phys(phys_addr_t phys, size_t size)
+{
+	return NULL;
 }
 
 static inline void kho_memory_init(void)
