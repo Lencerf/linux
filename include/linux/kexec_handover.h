@@ -47,7 +47,8 @@ struct kho_serialization {
 	struct kho_mem_track *tracker;
 };
 
-struct kho_in_node {
+struct kho_node {
+	/* private: internal fields of KHO */
 	const void *fdt;
 	int offset;
 };
@@ -84,6 +85,16 @@ struct folio *kho_restore_folio(phys_addr_t phys);
 void *kho_restore_phys(phys_addr_t phys, size_t size);
 
 void kho_memory_init(void);
+
+void kho_populate(phys_addr_t handover_fdt_phys, phys_addr_t scratch_phys,
+		  u64 scratch_len);
+
+int kho_retrieve_node(const struct kho_node *parent, const char *name,
+		      struct kho_node *child);
+const void *kho_retrieve_prop(const struct kho_node *node, const char *key,
+			      u32 *size);
+int kho_node_check_compatible(const struct kho_node *node,
+			      const char *compatible);
 #else
 static inline bool kho_is_enabled(void)
 {
@@ -195,6 +206,29 @@ static inline void *kho_restore_phys(phys_addr_t phys, size_t size)
 
 static inline void kho_memory_init(void)
 {
+}
+
+static inline void kho_populate(phys_addr_t handover_fdt_phys,
+				phys_addr_t scratch_phys, u64 scratch_len)
+{
+}
+
+static inline int kho_retrieve_node(const struct kho_node *parent,
+				    const char *name, struct kho_node *child)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline const void *kho_retrieve_prop(const struct kho_node *node,
+					    const char *key, u32 *size)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline int kho_node_check_compatible(const struct kho_node *node,
+					    const char *compatible)
+{
+	return -EOPNOTSUPP;
 }
 #endif /* CONFIG_KEXEC_HANDOVER */
 
