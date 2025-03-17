@@ -52,6 +52,11 @@ struct folio *kho_restore_folio(phys_addr_t phys);
 void *kho_restore_phys(phys_addr_t phys, size_t size);
 
 void kho_memory_init(void);
+
+void kho_populate(phys_addr_t handover_fdt_phys, phys_addr_t scratch_phys,
+		  u64 scratch_len);
+
+const void *kho_retrieve_fdt(const char *name);
 #else
 static inline bool kho_is_enabled(void)
 {
@@ -99,6 +104,17 @@ static inline void *kho_restore_phys(phys_addr_t phys, size_t size)
 static inline void kho_memory_init(void)
 {
 }
+
+static inline void kho_populate(phys_addr_t handover_fdt_phys,
+				phys_addr_t scratch_phys, u64 scratch_len)
+{
+}
+
+static inline const void *kho_retrieve_fdt(const char *name)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
 #endif /* CONFIG_KEXEC_HANDOVER */
 
 #endif /* LINUX_KEXEC_HANDOVER_H */
