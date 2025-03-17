@@ -40,6 +40,7 @@ early_param("kho", kho_parse_enable);
 /* Helper functions for KHO state tree */
 
 #define KHO_RECURSIVE_FDT_PROP "kho,recursive-fdt"
+#define KHO_PRESERVED_FOLIO_MAP_PROP "kho,preserved-folio-map"
 
 static int __kho_init_fdt(void *fdt)
 {
@@ -195,6 +196,12 @@ struct kho_out {
 	struct dentry *fdt_file;
 	struct dentry *dir;
 
+	/**
+	 * Physical address of the first struct khoser_mem_chunk containing
+	 * serialized data from struct kho_mem_track.
+	 */
+	phys_addr_t first_chunk_phys;
+
 	struct kho_fdt root_fdt;
 	bool finalized;
 };
@@ -215,6 +222,410 @@ int unregister_kho_notifier(struct notifier_block *nb)
 	return blocking_notifier_chain_unregister(&kho_out.chain_head, nb);
 }
 EXPORT_SYMBOL_GPL(unregister_kho_notifier);
+
+/*
+ * Keep track of memory that is to be preserved across KHO.
+ *
+ * The serializing side uses two levels of xarrays to manage chunks of per-order
+ * 512 byte bitmaps. For instance the entire 1G order of a 1TB system would fit
+ * inside a single 512 byte bitmap. For order 0 allocations each bitmap will
+ * cover 16M of address space. Thus, for 16G of memory at most 512K
+ * of bitmap memory will be needed for order 0.
+ *
+ * This approach is fully incremental, as the serialization progresses folios
+ * can continue be aggregated to the tracker. The final step, immediately prior
+ * to kexec would serialize the xarray information into a linked list for the
+ * successor kernel to parse.
+ */
+
+#define PRESERVE_BITS (512 * 8)
+
+struct kho_mem_phys_bits {
+	DECLARE_BITMAP(preserve, PRESERVE_BITS);
+};
+
+struct kho_mem_phys {
+	/*
+	 * Points to kho_mem_phys_bits, a sparse bitmap array. Each bit is sized
+	 * to order.
+	 */
+	struct xarray phys_bits;
+};
+
+struct kho_mem_track {
+	/* Points to kho_mem_phys, each order gets its own bitmap tree */
+	struct xarray orders;
+};
+
+static struct kho_mem_track kho_mem_track;
+
+static void *xa_load_or_alloc(struct xarray *xa, unsigned long index, size_t sz)
+{
+	void *elm, *res;
+
+	elm = xa_load(xa, index);
+	if (elm)
+		return elm;
+
+	elm = kzalloc(sz, GFP_KERNEL);
+	if (!elm)
+		return ERR_PTR(-ENOMEM);
+
+	res = xa_cmpxchg(xa, index, NULL, elm, GFP_KERNEL);
+	if (xa_is_err(res))
+		res = ERR_PTR(xa_err(res));
+
+	if (res) {
+		kfree(elm);
+		return res;
+	}
+
+	return elm;
+}
+
+static void __kho_unpreserve(struct kho_mem_track *tracker, unsigned long pfn,
+			     unsigned int order)
+{
+	struct kho_mem_phys_bits *bits;
+	struct kho_mem_phys *physxa;
+	unsigned long pfn_hi = pfn >> order;
+
+	physxa = xa_load(&tracker->orders, order);
+	if (!physxa)
+		return;
+
+	bits = xa_load(&physxa->phys_bits, pfn_hi / PRESERVE_BITS);
+	if (!bits)
+		return;
+
+	clear_bit(pfn_hi % PRESERVE_BITS, bits->preserve);
+}
+
+static int __kho_preserve(struct kho_mem_track *tracker, unsigned long pfn,
+			  unsigned int order)
+{
+	struct kho_mem_phys_bits *bits;
+	struct kho_mem_phys *physxa;
+	unsigned long pfn_hi = pfn >> order;
+
+	might_sleep();
+
+	physxa = xa_load_or_alloc(&tracker->orders, order, sizeof(*physxa));
+	if (IS_ERR(physxa))
+		return PTR_ERR(physxa);
+
+	bits = xa_load_or_alloc(&physxa->phys_bits, pfn_hi / PRESERVE_BITS,
+				sizeof(*bits));
+	if (IS_ERR(bits))
+		return PTR_ERR(bits);
+
+	set_bit(pfn_hi % PRESERVE_BITS, bits->preserve);
+
+	return 0;
+}
+
+/**
+ * kho_preserve_folio - preserve a folio across KHO.
+ * @folio: folio to preserve
+ *
+ * Records that the entire folio is preserved across KHO. The order
+ * will be preserved as well.
+ *
+ * Return: 0 on success, error code on failure
+ */
+int kho_preserve_folio(struct kho_mem_track *tracker, struct folio *folio)
+{
+	unsigned long pfn = folio_pfn(folio);
+	unsigned int order = folio_order(folio);
+
+	return __kho_preserve(tracker, pfn, order);
+}
+EXPORT_SYMBOL_GPL(kho_preserve_folio);
+
+/**
+ * kho_unpreserve_folio - unpreserve a folio
+ * @folio: folio to unpreserve
+ *
+ * Remove the record of a folio previously preserved by kho_preserve_folio().
+ *
+ * Return: 0 on success, error code on failure
+ */
+void kho_unpreserve_folio(struct kho_mem_track *tracker, struct folio *folio)
+{
+	unsigned long pfn = folio_pfn(folio);
+	unsigned int order = folio_order(folio);
+
+	return __kho_unpreserve(tracker, pfn, order);
+}
+EXPORT_SYMBOL_GPL(kho_unpreserve_folio);
+
+int kho_preserve_fdt(struct kho_mem_track *tracker, struct kho_fdt *fdt)
+{
+	return kho_preserve_folio(tracker, virt_to_folio(fdt->fdt));
+}
+
+void kho_unpreserve_fdt(struct kho_mem_track *tracker, struct kho_fdt *fdt)
+{
+	kho_unpreserve_folio(tracker, virt_to_folio(fdt->fdt));
+}
+
+/**
+ * kho_preserve_phys - preserve a physically contiguous range across KHO.
+ * @phys: physical address of the range
+ * @size: size of the range
+ *
+ * Records that the entire range from @phys to @phys + @size is preserved
+ * across KHO.
+ *
+ * Return: 0 on success, error code on failure
+ */
+int kho_preserve_phys(struct kho_mem_track *tracker, phys_addr_t phys,
+		      size_t size)
+{
+	unsigned long pfn = PHYS_PFN(phys), end_pfn = PHYS_PFN(phys + size);
+	unsigned int order = ilog2(end_pfn - pfn);
+	unsigned long failed_pfn;
+	int err = 0;
+
+	for (; pfn < end_pfn;
+	     pfn += (1 << order), order = ilog2(end_pfn - pfn)) {
+		err = __kho_preserve(tracker, pfn, order);
+		if (err) {
+			failed_pfn = pfn;
+			break;
+		}
+	}
+
+	if (err)
+		for (pfn = PHYS_PFN(phys); pfn < failed_pfn;
+		     pfn += (1 << order), order = ilog2(end_pfn - pfn))
+			__kho_unpreserve(tracker, pfn, order);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(kho_preserve_phys);
+
+/**
+ * kho_unpreserve_phys - unpreserve a physically contiguous range
+ * @phys: physical address of the range
+ * @size: size of the range
+ *
+ * Remove the record of a range previously preserved by kho_preserve_phys().
+ *
+ * Return: 0 on success, error code on failure
+ */
+int kho_unpreserve_phys(struct kho_mem_track *tracker, phys_addr_t phys,
+			size_t size)
+{
+	unsigned long pfn = PHYS_PFN(phys), end_pfn = PHYS_PFN(phys + size);
+	unsigned int order = ilog2(end_pfn - pfn);
+	int err = 0;
+
+	for (; pfn < end_pfn; pfn += (1 << order), order = ilog2(end_pfn - pfn))
+		__kho_unpreserve(tracker, pfn, order);
+
+	return err;
+}
+EXPORT_SYMBOL_GPL(kho_unpreserve_phys);
+
+/* almost as free_reserved_page(), just don't free the page */
+static void kho_restore_page(struct page *page)
+{
+	ClearPageReserved(page);
+	init_page_count(page);
+	adjust_managed_page_count(page, 1);
+}
+
+struct folio *kho_restore_folio(phys_addr_t phys)
+{
+	struct page *page = pfn_to_online_page(PHYS_PFN(phys));
+	unsigned long order = page->private;
+
+	if (!page)
+		return NULL;
+
+	order = page->private;
+	if (order)
+		prep_compound_page(page, order);
+	else
+		kho_restore_page(page);
+
+	return page_folio(page);
+}
+EXPORT_SYMBOL_GPL(kho_restore_folio);
+
+void *kho_restore_phys(phys_addr_t phys, size_t size)
+{
+	unsigned long start_pfn, end_pfn, pfn;
+	void *va = __va(phys);
+
+	start_pfn = PFN_DOWN(phys);
+	end_pfn = PFN_UP(phys + size);
+
+	for (pfn = start_pfn; pfn < end_pfn; pfn++) {
+		struct page *page = pfn_to_online_page(pfn);
+
+		if (!page)
+			return NULL;
+		kho_restore_page(page);
+	}
+
+	return va;
+}
+EXPORT_SYMBOL_GPL(kho_restore_phys);
+
+struct khoser_mem_bitmap_ptr {
+	phys_addr_t phys_start;
+	DECLARE_KHOSER_PTR(bitmap, struct kho_mem_phys_bits *);
+};
+
+struct khoser_mem_chunk;
+
+struct khoser_mem_chunk_hdr {
+	DECLARE_KHOSER_PTR(next, struct khoser_mem_chunk *);
+	unsigned int order;
+	unsigned int num_elms;
+};
+
+#define KHOSER_BITMAP_SIZE                                   \
+	((PAGE_SIZE - sizeof(struct khoser_mem_chunk_hdr)) / \
+	 sizeof(struct khoser_mem_bitmap_ptr))
+
+struct khoser_mem_chunk {
+	struct khoser_mem_chunk_hdr hdr;
+	struct khoser_mem_bitmap_ptr bitmaps[KHOSER_BITMAP_SIZE];
+};
+
+static_assert(sizeof(struct khoser_mem_chunk) == PAGE_SIZE);
+
+static struct khoser_mem_chunk *new_chunk(struct khoser_mem_chunk *cur_chunk,
+					  unsigned long order)
+{
+	struct khoser_mem_chunk *chunk;
+
+	chunk = (struct khoser_mem_chunk *)get_zeroed_page(GFP_KERNEL);
+	if (!chunk)
+		return NULL;
+	chunk->hdr.order = order;
+	if (cur_chunk)
+		KHOSER_STORE_PTR(cur_chunk->hdr.next, chunk);
+	return chunk;
+}
+
+static void kho_mem_ser_free(struct khoser_mem_chunk *first_chunk)
+{
+	struct khoser_mem_chunk *chunk = first_chunk;
+
+	while (chunk) {
+		unsigned long chunk_page = (unsigned long)chunk;
+
+		chunk = KHOSER_LOAD_PTR(chunk->hdr.next);
+		free_page(chunk_page);
+	}
+}
+
+/*
+ * Record all the bitmaps in a linked list of pages for the next kernel to
+ * process. Each chunk holds bitmaps of the same order and each block of bitmaps
+ * starts at a given physical address. This allows the bitmaps to be sparse. The
+ * xarray is used to store them in a tree while building up the data structure,
+ * but the KHO successor kernel only needs to process them once in order.
+ *
+ * All of this memory is normal kmalloc() memory and is not marked for
+ * preservation. The successor kernel will remain isolated to the scratch space
+ * until it completes processing this list. Once processed all the memory
+ * storing these ranges will be marked as free.
+ */
+static struct khoser_mem_chunk *kho_mem_serialize(void)
+{
+	struct kho_mem_track *tracker = &kho_mem_track;
+	struct khoser_mem_chunk *first_chunk = NULL;
+	struct khoser_mem_chunk *chunk = NULL;
+	struct kho_mem_phys *physxa;
+	unsigned long order;
+
+	xa_for_each(&tracker->orders, order, physxa) {
+		struct kho_mem_phys_bits *bits;
+		unsigned long phys;
+
+		chunk = new_chunk(chunk, order);
+		if (!chunk)
+			goto err_free;
+
+		if (!first_chunk)
+			first_chunk = chunk;
+
+		xa_for_each(&physxa->phys_bits, phys, bits) {
+			struct khoser_mem_bitmap_ptr *elm;
+
+			if (chunk->hdr.num_elms == ARRAY_SIZE(chunk->bitmaps)) {
+				chunk = new_chunk(chunk, order);
+				if (!chunk)
+					goto err_free;
+			}
+
+			elm = &chunk->bitmaps[chunk->hdr.num_elms];
+			chunk->hdr.num_elms++;
+			elm->phys_start = (phys * PRESERVE_BITS)
+					  << (order + PAGE_SHIFT);
+			KHOSER_STORE_PTR(elm->bitmap, bits);
+		}
+	}
+
+	return first_chunk;
+
+err_free:
+	kho_mem_ser_free(first_chunk);
+	return ERR_PTR(-ENOMEM);
+}
+
+static void deserialize_bitmap(unsigned int order,
+			       struct khoser_mem_bitmap_ptr *elm)
+{
+	struct kho_mem_phys_bits *bitmap = KHOSER_LOAD_PTR(elm->bitmap);
+	unsigned long bit;
+
+	for_each_set_bit(bit, bitmap->preserve, PRESERVE_BITS) {
+		int sz = 1 << (order + PAGE_SHIFT);
+		phys_addr_t phys =
+			elm->phys_start + (bit << (order + PAGE_SHIFT));
+		struct page *page = phys_to_page(phys);
+
+		memblock_reserve(phys, sz);
+		memblock_reserved_mark_noinit(phys, sz);
+		page->private = order;
+	}
+}
+
+static void __init kho_mem_deserialize(void)
+{
+	struct khoser_mem_chunk *chunk;
+	const void *fdt = kho_get_fdt();
+	const phys_addr_t *mem;
+	int len;
+
+	if (!fdt)
+		return;
+
+	mem = fdt_getprop(fdt, 0, KHO_PRESERVED_FOLIO_MAP_PROP, &len);
+
+	if (!mem || len != sizeof(*mem)) {
+		pr_err("failed to get preserved memory bitmaps\n");
+		return;
+	}
+
+	chunk = *mem ? phys_to_virt(*mem) : NULL;
+	while (chunk) {
+		unsigned int i;
+
+		memblock_reserve(virt_to_phys(chunk), sizeof(*chunk));
+
+		for (i = 0; i != chunk->hdr.num_elms; i++)
+			deserialize_bitmap(chunk->hdr.order,
+					   &chunk->bitmaps[i]);
+		chunk = KHOSER_LOAD_PTR(chunk->hdr.next);
+	}
+}
 
 static int kho_out_update_debugfs_fdt(void)
 {
@@ -240,6 +651,14 @@ static int kho_abort(void)
 
 	kho_reset_fdt(&kho_out.root_fdt);
 
+	if (kho_out.first_chunk_phys) {
+		struct khoser_mem_chunk *first_chunk =
+			phys_to_virt(kho_out.first_chunk_phys);
+
+		kho_mem_ser_free(first_chunk);
+		kho_out.first_chunk_phys = 0;
+	}
+
 	err = blocking_notifier_call_chain(&kho_out.chain_head, KEXEC_KHO_ABORT,
 					   NULL);
 
@@ -257,14 +676,30 @@ static int kho_finalize(void)
 	if (err)
 		goto unfreeze;
 
+	/* Reserve the kho,preserved-folio-map property in the root FDT */
+	err = fdt_property_placeholder(root->fdt, KHO_PRESERVED_FOLIO_MAP_PROP,
+				       sizeof(phys_addr_t),
+				       (void **)&first_chunk_phys);
+	if (err)
+		goto unfreeze;
+
 	struct kho_serialization ser = {
 		.fdt = &kho_out.root_fdt,
+		.tracker = &kho_mem_track,
 	};
 	err = blocking_notifier_call_chain(&kho_out.chain_head,
 					   KEXEC_KHO_FINALIZE, &ser);
 	err = notifier_to_errno(err);
 	if (err)
 		goto unfreeze;
+
+	first_chunk = kho_mem_serialize();
+	if (IS_ERR(first_chunk)) {
+		err = PTR_ERR(first_chunk);
+		goto unfreeze;
+	}
+	*first_chunk_phys = first_chunk ? virt_to_phys(first_chunk) : 0;
+	kho_out.first_chunk_phys = *first_chunk_phys;
 
 	err = kho_end_node(root);
 	if (err)
@@ -390,6 +825,11 @@ static __init int kho_init(void)
 	if (err) {
 		pr_err("failed to init KHO root FDT: %d\n", err);
 		goto err_free_scratch;
+	}
+	err = kho_preserve_fdt(&kho_mem_track, &kho_out.root_fdt);
+	if (err) {
+		pr_err("failed to preserve KHO root FDT: %d\n", err);
+		goto err_free_fdt;
 	}
 
 	debugfs_root = debugfs_create_dir("kho", NULL);
@@ -614,5 +1054,8 @@ err_disable_kho:
 
 void __init kho_memory_init(void)
 {
-	kho_reserve_scratch();
+	if (!kho_get_fdt())
+		kho_reserve_scratch();
+	else
+		kho_mem_deserialize();
 }

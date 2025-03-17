@@ -16,14 +16,40 @@ enum kho_event {
 };
 
 struct notifier_block;
+struct folio;
+
+#define DECLARE_KHOSER_PTR(name, type) \
+	union {                        \
+		phys_addr_t phys;      \
+		type ptr;              \
+	} name
+#define KHOSER_STORE_PTR(dest, val)               \
+	({                                        \
+		typeof(val) v = val;              \
+		typecheck(typeof((dest).ptr), v); \
+		(dest).phys = virt_to_phys(v);    \
+	})
+#define KHOSER_LOAD_PTR(src)                                                 \
+	({                                                                   \
+		typeof(src) s = src;                                         \
+		(typeof((s).ptr))((s).phys ? phys_to_virt((s).phys) : NULL); \
+	})
 
 struct kho_fdt {
 	/* private: internal fields of KHO */
 	void *fdt;
 };
 
+struct kho_mem_track;
+
 struct kho_serialization {
 	struct kho_fdt *fdt;
+	struct kho_mem_track *tracker;
+};
+
+struct kho_in_node {
+	const void *fdt;
+	int offset;
 };
 
 #ifdef CONFIG_KEXEC_HANDOVER
@@ -45,6 +71,17 @@ int kho_link_fdt(struct kho_fdt *parent, const char *name,
 
 int register_kho_notifier(struct notifier_block *nb);
 int unregister_kho_notifier(struct notifier_block *nb);
+
+int kho_preserve_folio(struct kho_mem_track *tracker, struct folio *folio);
+void kho_unpreserve_folio(struct kho_mem_track *tracker, struct folio *folio);
+int kho_preserve_phys(struct kho_mem_track *tracker, phys_addr_t phys,
+		      size_t size);
+int kho_unpreserve_phys(struct kho_mem_track *tracker, phys_addr_t phys,
+			size_t size);
+int kho_preserve_fdt(struct kho_mem_track *tracker, struct kho_fdt *fdt);
+void kho_unpreserve_fdt(struct kho_mem_track *tracker, struct kho_fdt *fdt);
+struct folio *kho_restore_folio(phys_addr_t phys);
+void *kho_restore_phys(phys_addr_t phys, size_t size);
 
 void kho_memory_init(void);
 #else
@@ -113,6 +150,47 @@ static inline int register_kho_notifier(struct notifier_block *nb)
 static inline int unregister_kho_notifier(struct notifier_block *nb)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int kho_preserve_folio(struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_unpreserve_folio(struct folio *folio)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_preserve_phys(phys_addr_t phys, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_unpreserve_phys(phys_addr_t phys, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_preserve_fdt(struct kho_mem_track *tracker,
+				   struct kho_fdt *fdt)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kho_unpreserve_fdt(struct kho_mem_track *tracker,
+				      struct kho_fdt *fdt)
+{
+}
+
+static inline struct folio *kho_restore_folio(phys_addr_t phys)
+{
+	return NULL;
+}
+
+static inline void *kho_restore_phys(phys_addr_t phys, size_t size)
+{
+	return NULL;
 }
 
 static inline void kho_memory_init(void)
