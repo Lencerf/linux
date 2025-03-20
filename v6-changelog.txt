@@ -1,0 +1,35 @@
+* Remove hashtable-based API, add recursive FDT support.
+* Remove fdt_max. Each FDT fragment is limited to 4KiB [5].
+* KHO FDT is completely outside of the scratch area. struct kimage only
+  remembers the physical address of the root KHO FDT page.
+* Switch the order of "kexec: add KHO parsing support" and "kexec: enable
+  KHO support for memory preservation" since parsing recursive FDT needs
+  kho_restore_folio().
+* Move linked pages of bitmaps of preserved memory from /preserved-memory.metadata
+  to preserved-folio-map of KHO root FDT as suggested in [1].
+* Remove "memblock_reserve(handover_fdt_phys, fdt_size)" from kho_populate()
+  since it will be handled in kho_mem_deserialize().
+* Add struct kho_serialization to hold the root FDT and struct kho_mem_track and
+  pass it through notifiers as suggested in [3].
+* Update the example of memblock. memblock now prepares the KHO FDT fragment
+  early. In the notifier callback, only reserve the memory and register
+  the FDT fragment to KHO root tree.
+* Rename kho_get_node/kho_get_prop to kho_retrieve_node/kho_retrieve_prop.
+* Rename KHOSER_PTR to DECLARE_KHOSER_PTR to make checkpatch.pl happy.
+* In kho_parse_scratch_size(), replace simple_strtoul() with kstrtouint().
+* Trivially rebase the patchset on to tag v6.14.
+* Add KHO property docs to github.com/devicetree-org/dt-schema [2].
+
+TODO:
+* Add YAML files back to describe the FDT schema.
+* Update documentation and patch commit messages.
+* Answer Jason's question on kho_restore_phys() [4]
+* How should we expose sub FDT fragment blob in debugfs? Create recursive
+  directories and bin files?
+* Address remaining feedbacks from the community.
+
+[1] https://lore.kernel.org/all/20250212152336.GA3848889@nvidia.com/
+[2] https://github.com/devicetree-org/dt-schema/pull/158
+[3] https://lore.kernel.org/all/20250321134629.GA252045@nvidia.com/
+[4] https://lore.kernel.org/all/Z+IPEeg7jkjrIB+8@nvidia.com/
+[5] https://lore.kernel.org/all/Z+ITA48uRCpMkvGV@nvidia.com/
