@@ -210,6 +210,8 @@ ForEachMacros:
   - 'evlist__for_each_entry_from'
   - 'evlist__for_each_entry_reverse'
   - 'evlist__for_each_entry_safe'
+  - 'fdt_for_each_property_offset'
+  - 'fdt_for_each_subnode'
   - 'flow_action_for_each'
   - 'for_each_acpi_consumer_dev'
   - 'for_each_acpi_dev_match'
