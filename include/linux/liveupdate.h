@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/list.h>
 #include <linux/mm_types.h>
+#include <uapi/linux/liveupdate.h>
 
 /**
  * enum liveupdate_event - Events that trigger live update callbacks.
@@ -54,38 +55,6 @@ enum liveupdate_event {
 	LIVEUPDATE_REBOOT,
 	LIVEUPDATE_FINISH,
 	LIVEUPDATE_CANCEL,
-};
-
-/**
- * enum liveupdate_state - Defines the possible states of the live update
- * orchestrator.
- * @LIVEUPDATE_STATE_NORMAL:         Default state, no live update in progress.
- * @LIVEUPDATE_STATE_PREPARED:       Live update is prepared for reboot; the
- *                                   LIVEUPDATE_PREPARE callbacks have completed
- *                                   successfully.
- *                                   Devices might operate in a limited state
- *                                   for example the participating devices might
- *                                   not be allowed to unbind, and also the
- *                                   setting up of new DMA mappings might be
- *                                   disabled in this state.
- * @LIVEUPDATE_STATE_FROZEN:         The final reboot event
- *                                   (%LIVEUPDATE_REBOOT) has been sent, and the
- *                                   system is performing its final state saving
- *                                   within the "blackout window". User
- *                                   workloads must be suspended. The actual
- *                                   reboot (kexec) into the new kernel is
- *                                   imminent.
- * @LIVEUPDATE_STATE_UPDATED:        The system has rebooted into a new kernel
- *                                   via live update the system is now running
- *                                   the new kernel, awaiting the finish event.
- *
- * These states track the progress and outcome of a live update operation.
- */
-enum liveupdate_state  {
-	LIVEUPDATE_STATE_NORMAL = 0,
-	LIVEUPDATE_STATE_PREPARED = 1,
-	LIVEUPDATE_STATE_FROZEN = 2,
-	LIVEUPDATE_STATE_UPDATED = 3,
 };
 
 /* Forward declaration needed if definition isn't included */
