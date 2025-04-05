@@ -4,6 +4,18 @@
 
 #include <linux/types.h>
 
+struct kho_scratch {
+	phys_addr_t addr;
+	phys_addr_t size;
+};
+
+/* KHO Notifier index */
+enum kho_event {
+	KEXEC_KHO_FINALIZE = 0,
+	KEXEC_KHO_ABORT = 1,
+};
+
+struct notifier_block;
 struct folio;
 
 #define DECLARE_KHOSER_PTR(name, type) \
@@ -26,7 +38,10 @@ struct folio;
 struct kho_serialization;
 
 #ifdef CONFIG_KEXEC_HANDOVER
+bool kho_is_enabled(void);
 
+int kho_register_preserved_mem(struct kho_serialization *ser, const char *name,
+			       void *data, size_t size);
 int kho_preserve_folio(struct kho_serialization *ser, char *name,
 		       struct folio *folio);
 int kho_preserve_phys(struct kho_serialization *ser, char *name,
@@ -34,7 +49,22 @@ int kho_preserve_phys(struct kho_serialization *ser, char *name,
 struct folio *kho_restore_folio(phys_addr_t phys);
 void *kho_restore_phys(phys_addr_t phys, size_t size);
 
+int register_kho_notifier(struct notifier_block *nb);
+int unregister_kho_notifier(struct notifier_block *nb);
+
+void kho_memory_init(void);
 #else
+static inline bool kho_is_enabled(void)
+{
+	return false;
+}
+
+static inline int kho_register_preserved_mem(struct kho_serialization *ser,
+					     const char *name, void *data,
+					     size_t size)
+{
+	return -EOPNOTSUPP;
+}
 
 static inline int kho_preserve_folio(struct kho_serialization *ser, char *name,
 				     struct folio *folio)
@@ -58,6 +88,19 @@ static inline void *kho_restore_phys(phys_addr_t phys, size_t size)
 	return NULL;
 }
 
+static inline int register_kho_notifier(struct notifier_block *nb)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int unregister_kho_notifier(struct notifier_block *nb)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void kho_memory_init(void)
+{
+}
 #endif /* CONFIG_KEXEC_HANDOVER */
 
 #endif /* LINUX_KEXEC_HANDOVER_H */
