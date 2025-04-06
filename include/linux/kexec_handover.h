@@ -48,11 +48,16 @@ int kho_preserve_phys(struct kho_serialization *ser, char *name,
 		      phys_addr_t phys, size_t size);
 struct folio *kho_restore_folio(phys_addr_t phys);
 void *kho_restore_phys(phys_addr_t phys, size_t size);
+int kho_retrieve_folio(const char *name, phys_addr_t *phys);
+int kho_retrieve_phys(const char *name, phys_addr_t *phys, size_t *size);
 
 int register_kho_notifier(struct notifier_block *nb);
 int unregister_kho_notifier(struct notifier_block *nb);
 
 void kho_memory_init(void);
+
+void kho_populate(phys_addr_t handover_fdt_phys, phys_addr_t scratch_phys,
+		  u64 scratch_len);
 #else
 static inline bool kho_is_enabled(void)
 {
@@ -88,6 +93,17 @@ static inline void *kho_restore_phys(phys_addr_t phys, size_t size)
 	return NULL;
 }
 
+static inline int kho_retrieve_folio(const char *name, phys_addr_t *phys)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int kho_retrieve_phys(const char *name, phys_addr_t *phys,
+				    size_t *size)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline int register_kho_notifier(struct notifier_block *nb)
 {
 	return -EOPNOTSUPP;
@@ -99,6 +115,11 @@ static inline int unregister_kho_notifier(struct notifier_block *nb)
 }
 
 static inline void kho_memory_init(void)
+{
+}
+
+static inline void kho_populate(phys_addr_t handover_fdt_phys,
+				phys_addr_t scratch_phys, u64 scratch_len)
 {
 }
 #endif /* CONFIG_KEXEC_HANDOVER */
