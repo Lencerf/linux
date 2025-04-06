@@ -949,9 +949,126 @@ err_rmdir:
 	return -ENOENT;
 }
 
+struct kho_in {
+	struct debugfs_blob_wrapper fdt_wrapper;
+	struct dentry *dir;
+	phys_addr_t fdt_phys;
+	phys_addr_t scratch_phys;
+	struct list_head fdt_folios;
+};
+
+static struct kho_in kho_in = {
+	.fdt_folios = LIST_HEAD_INIT(kho_in.fdt_folios),
+};
+
+static const void *kho_get_fdt(void)
+{
+	return kho_in.fdt_phys ? phys_to_virt(kho_in.fdt_phys) : NULL;
+}
+
+/**
+ * kho_retrieve_folio - retrieve a preserved folio by its name.
+ * @name: the name of the folio passed to kho_record_folio().
+ * @type: the @type passed to kho_record_folio().
+ * @phys: if found, the physical address of the folio is stored in @phys.
+ *
+ * Retrieve a preserved folio named @name and store its physical
+ * address in @phys.
+ *
+ * Return: 0 on success, error code on failure
+ */
+int kho_retrieve_folio(const char *name, enum kho_folio_t type,
+		       phys_addr_t *phys)
+{
+	const void *fdt = kho_get_fdt();
+	const void *prop = kho_folio_type_prop(type);
+	const u64 *val;
+	int offset, len;
+
+	if (!fdt)
+		return -ENOENT;
+
+	if (!phys)
+		return -EINVAL;
+
+	if (IS_ERR(prop))
+		return PTR_ERR(prop);
+
+	offset = fdt_subnode_offset(fdt, 0, name);
+	if (offset < 0)
+		return -ENOENT;
+
+	val = fdt_getprop(fdt, offset, prop, &len);
+	if (!val || len != sizeof(*val))
+		return -EINVAL;
+
+	*phys = *val;
+	if (!PAGE_ALIGNED(*phys))
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(kho_retrieve_folio);
+
+/* Handling for debugfs/kho/in */
+
+static __init int kho_in_debugfs_init(const void *fdt)
+{
+	struct dentry *file, *ff_dir;
+	int err, child;
+
+	kho_in.dir = debugfs_create_dir("in", debugfs_root);
+	if (IS_ERR(kho_in.dir))
+		return PTR_ERR(kho_in.dir);
+
+	kho_in.fdt_wrapper.size = fdt_totalsize(fdt);
+	kho_in.fdt_wrapper.data = (void *)fdt;
+	file = debugfs_create_blob("fdt", 0400, kho_in.dir,
+				   &kho_in.fdt_wrapper);
+	if (IS_ERR(file)) {
+		err = PTR_ERR(file);
+		goto err_rmdir;
+	}
+
+	ff_dir = debugfs_create_dir("fdt_folios", kho_in.dir);
+	if (IS_ERR(ff_dir)) {
+		err = PTR_ERR(file);
+		goto err_rmdir;
+	}
+
+	fdt_for_each_subnode(child, fdt, 0) {
+		int len = 0;
+		const char *name = fdt_get_name(fdt, child, NULL);
+		const u64 *fdt_phys;
+
+		fdt_phys = fdt_getprop(fdt, child, "fdt", &len);
+		if (!fdt_phys)
+			continue;
+		if (len != sizeof(*fdt_phys)) {
+			pr_warn("node `%s`'s prop fdt has invalid length: %d.\n",
+				name, len);
+			continue;
+		}
+		err = kho_add_fdt_folio(&kho_in.fdt_folios, ff_dir, name,
+					phys_to_virt(*fdt_phys));
+		if (err) {
+			pr_warn("failed to add fdt `%s` to debugfs: %d\n", name,
+				err);
+			continue;
+		}
+	}
+
+	return 0;
+
+err_rmdir:
+	debugfs_remove_recursive(kho_in.dir);
+	return err;
+}
+
 static __init int kho_init(void)
 {
 	int err = 0;
+	const void *fdt = kho_get_fdt();
 
 	if (!kho_enable)
 		return 0;
@@ -971,6 +1088,20 @@ static __init int kho_init(void)
 	err = kho_out_debugfs_init();
 	if (err)
 		goto err_free_fdt;
+
+	if (fdt) {
+		err = kho_in_debugfs_init(fdt);
+		/*
+		 * Failure to create /sys/kernel/debug/kho/in does not prevent
+		 * reviving state from KHO and setting up KHO for the next
+		 * kexec.
+		 */
+		if (err)
+			pr_err("failed exposing handover FDT in debugfs: %d\n",
+			       err);
+
+		return 0;
+	}
 
 	for (int i = 0; i < kho_scratch_cnt; i++) {
 		unsigned long base_pfn = PHYS_PFN(kho_scratch[i].addr);
@@ -999,7 +1130,116 @@ err_free_scratch:
 }
 late_initcall(kho_init);
 
+static void __init kho_release_scratch(void)
+{
+	phys_addr_t start, end;
+	u64 i;
+
+	memmap_init_kho_scratch_pages();
+
+	/*
+	 * Mark scratch mem as CMA before we return it. That way we
+	 * ensure that no kernel allocations happen on it. That means
+	 * we can reuse it as scratch memory again later.
+	 */
+	__for_each_mem_range(i, &memblock.memory, NULL, NUMA_NO_NODE,
+			     MEMBLOCK_KHO_SCRATCH, &start, &end, NULL) {
+		ulong start_pfn = pageblock_start_pfn(PFN_DOWN(start));
+		ulong end_pfn = pageblock_align(PFN_UP(end));
+		ulong pfn;
+
+		for (pfn = start_pfn; pfn < end_pfn; pfn += pageblock_nr_pages)
+			set_pageblock_migratetype(pfn_to_page(pfn),
+						  MIGRATE_CMA);
+	}
+}
+
 void __init kho_memory_init(void)
 {
-	kho_reserve_scratch();
+	if (kho_in.scratch_phys) {
+		kho_scratch = phys_to_virt(kho_in.scratch_phys);
+		kho_release_scratch();
+
+		kho_mem_deserialize(kho_get_fdt());
+	} else {
+		kho_reserve_scratch();
+	}
+}
+
+void __init kho_populate(phys_addr_t fdt_phys, phys_addr_t scratch_phys,
+			 u64 scratch_len)
+{
+	void *fdt = NULL;
+	struct kho_scratch *scratch = NULL;
+	int err = 0;
+	unsigned int scratch_cnt = scratch_len / sizeof(*kho_scratch);
+
+	/* Validate the input FDT */
+	fdt = early_memremap(fdt_phys, sizeof(struct fdt_header));
+	if (!fdt) {
+		pr_warn("setup: failed to memremap FDT (0x%llx)\n", fdt_phys);
+		err = -EFAULT;
+		goto out;
+	}
+	err = fdt_check_header(fdt);
+	if (fdt_check_header(fdt)) {
+		pr_warn("setup: handover FDT (0x%llx) is invalid: %d\n",
+			fdt_phys, err);
+		err = -EINVAL;
+		goto out;
+	}
+
+	scratch = early_memremap(scratch_phys, scratch_len);
+	if (!scratch) {
+		pr_warn("setup: failed to memremap scratch (phys=0x%llx, len=%lld)\n",
+			scratch_phys, scratch_len);
+		err = -EFAULT;
+		goto out;
+	}
+
+	/*
+	 * We pass a safe contiguous blocks of memory to use for early boot
+	 * purporses from the previous kernel so that we can resize the
+	 * memblock array as needed.
+	 */
+	for (int i = 0; i < scratch_cnt; i++) {
+		struct kho_scratch *area = &scratch[i];
+		u64 size = area->size;
+
+		memblock_add(area->addr, size);
+		err = memblock_mark_kho_scratch(area->addr, size);
+		if (WARN_ON(err)) {
+			pr_err("failed to mark the scratch region 0x%pa+0x%pa: %d",
+			       &area->addr, &size, err);
+			goto out;
+		}
+		pr_debug("Marked 0x%pa+0x%pa as scratch", &area->addr, &size);
+	}
+
+	memblock_reserve(scratch_phys, scratch_len);
+
+	/*
+	 * Now that we have a viable region of scratch memory, let's tell
+	 * the memblocks allocator to only use that for any allocations.
+	 * That way we ensure that nothing scribbles over in use data while
+	 * we initialize the page tables which we will need to ingest all
+	 * memory reservations from the previous kernel.
+	 */
+	memblock_set_kho_scratch_only();
+
+out:
+	if (fdt)
+		early_memunmap(fdt, sizeof(struct fdt_header));
+	if (scratch)
+		early_memunmap(scratch, scratch_len);
+	if (err) {
+		pr_err("disabling KHO revival: %d\n", err);
+		return;
+	}
+
+	pr_info("found kexec handover data. Will skip init for some devices\n");
+
+	kho_in.fdt_phys = fdt_phys;
+	kho_in.scratch_phys = scratch_phys;
+	kho_scratch_cnt = scratch_cnt;
 }
