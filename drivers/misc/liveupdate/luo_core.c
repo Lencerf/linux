@@ -36,7 +36,9 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/err.h>
+#include <linux/kexec_handover.h>
 #include <linux/kobject.h>
+#include <linux/libfdt.h>
 #include <linux/liveupdate.h>
 #include <linux/rwsem.h>
 #include <linux/string.h>
@@ -62,6 +64,14 @@ const char *const luo_state_str[] = {
 
 bool luo_enabled;
 
+static void *luo_fdt_out;
+static void *luo_fdt_in;
+/* LUO FDT size is 2M, if needed can be expanded */
+#define LUO_FDT_SIZE		(2 << 20)
+#define LUO_KHO_ENTRY_NAME	"LUO"
+#define LUO_STATE		"state"
+#define LUO_COMPATIBLE		"luo-v1"
+
 static int __init early_liveupdate_param(char *buf)
 {
 	return kstrtobool(buf, &luo_enabled);
@@ -73,6 +83,17 @@ early_param("liveupdate", early_liveupdate_param);
 
 static void __luo_set_state(enum liveupdate_state state)
 {
+	void *fdt = luo_fdt_out ? luo_fdt_out : luo_fdt_in;
+
+	if (fdt) {
+		u8 *state_ptr = (u8 *)fdt_getprop_w(fdt, 0, LUO_STATE, NULL);
+
+		if (!state_ptr)
+			pr_warn("failed to update fdt state property\n");
+		else
+			*state_ptr = (u8)state;
+	}
+
 	WRITE_ONCE(luo_state, state);
 }
 
@@ -83,6 +104,62 @@ static inline void luo_set_state(enum liveupdate_state state)
 	__luo_set_state(state);
 }
 
+/* Called during the prepare phase, to create LUO fdt tree */
+static int luo_fdt_setup(struct kho_serialization *ser)
+{
+	u8 state_val;
+	int ret;
+
+	luo_fdt_out = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+					       get_order(LUO_FDT_SIZE));
+	if (!luo_fdt_out) {
+		pr_err("failed to allocate FDT memory\n");
+		return -ENOMEM;
+	}
+
+	ret = fdt_create_empty_tree(luo_fdt_out, LUO_FDT_SIZE);
+	if (ret)
+		goto exit_free;
+
+	ret = fdt_setprop(luo_fdt_out, 0, "compatible", LUO_COMPATIBLE,
+			  strlen(LUO_COMPATIBLE) + 1);
+	if (ret)
+		goto exit_free;
+
+	ret = fdt_setprop(luo_fdt_out, 0, LUO_STATE, &state_val,
+			  sizeof(state_val));
+	if (ret)
+		goto exit_free;
+
+	ret = kho_preserve_phys(ser, __pa(luo_fdt_out), LUO_FDT_SIZE);
+	if (ret)
+		goto exit_free;
+
+	ret = kho_add_subtree(ser, LUO_KHO_ENTRY_NAME, luo_fdt_out);
+	if (ret)
+		goto exit_free;
+
+	return 0;
+
+exit_free:
+	pr_err("failed to prepare LUO FDT: %d\n", ret);
+	free_pages((unsigned long)luo_fdt_out, get_order(LUO_FDT_SIZE));
+	luo_fdt_out = NULL;
+
+	return ret;
+}
+
+static void luo_fdt_destroy(struct kho_serialization *ser)
+{
+	free_pages((unsigned long)luo_fdt_out, get_order(LUO_FDT_SIZE));
+	luo_fdt_out = NULL;
+}
+
+static int luo_do_prepare_calls(void)
+{
+	return 0;
+}
+
 static int luo_do_reboot_calls(void)
 {
 	return 0;
@@ -91,6 +168,91 @@ static int luo_do_reboot_calls(void)
 static void luo_do_finish_calls(void)
 {
 }
+
+static void luo_do_cancel_calls(void)
+{
+}
+
+static int __luo_prepare(struct kho_serialization *ser)
+{
+	int ret;
+
+	if (down_write_killable(&luo_state_rwsem)) {
+		pr_warn("[prepare] event canceled by user\n");
+		return -EAGAIN;
+	}
+
+	if (!IS_STATE(LIVEUPDATE_STATE_NORMAL)) {
+		pr_warn("Can't switch to [%s] from [%s] state\n",
+			luo_state_str[LIVEUPDATE_STATE_PREPARED],
+			LUO_STATE_STR);
+		ret = -EINVAL;
+		goto exit_unlock;
+	}
+
+	ret = luo_fdt_setup(ser);
+	if (ret)
+		goto exit_unlock;
+
+	ret = luo_do_prepare_calls();
+	if (ret)
+		goto exit_unlock;
+
+	luo_set_state(LIVEUPDATE_STATE_PREPARED);
+
+exit_unlock:
+	up_write(&luo_state_rwsem);
+
+	return ret;
+}
+
+static int __luo_cancel(struct kho_serialization *ser)
+{
+	if (down_write_killable(&luo_state_rwsem)) {
+		pr_warn("[cancel] event canceled by user\n");
+		return -EAGAIN;
+	}
+
+	if (!IS_STATE(LIVEUPDATE_STATE_PREPARED)) {
+		pr_warn("Can't switch to [%s] from [%s] state\n",
+			luo_state_str[LIVEUPDATE_STATE_NORMAL],
+			LUO_STATE_STR);
+		up_write(&luo_state_rwsem);
+
+		return -EINVAL;
+	}
+
+	luo_do_cancel_calls();
+	luo_fdt_destroy(ser);
+	luo_set_state(LIVEUPDATE_STATE_NORMAL);
+
+	up_write(&luo_state_rwsem);
+
+	return 0;
+}
+
+static int luo_kho_prepare_notifier(struct notifier_block *self,
+				    unsigned long cmd, void *v)
+{
+	int ret;
+
+	switch (cmd) {
+	case KEXEC_KHO_FINALIZE:
+		ret = __luo_prepare((struct kho_serialization *)v);
+		break;
+	case KEXEC_KHO_ABORT:
+		ret = __luo_cancel((struct kho_serialization *)v);
+		break;
+	default:
+		ret = NOTIFY_BAD;
+	}
+
+	return notifier_from_errno(ret);
+}
+
+static struct notifier_block luo_kho_prepare_notifier_nb = {
+	.notifier_call = luo_kho_prepare_notifier,
+};
 
 /**
  * luo_prepare - Initiate the live update preparation phase.
@@ -108,7 +270,7 @@ static void luo_do_finish_calls(void)
  */
 int luo_prepare(void)
 {
-	return 0;
+	return kho_finalize();
 }
 
 /**
@@ -222,12 +384,60 @@ int luo_finish(void)
  */
 int luo_cancel(void)
 {
-	return 0;
+	return kho_abort();
 }
 
 static int __init luo_startup(void)
 {
-	__luo_set_state(LIVEUPDATE_STATE_NORMAL);
+	phys_addr_t fdt_phys;
+	u8 *state_ptr;
+	int prop_len;
+	int ret;
+
+	if (!kho_is_enabled()) {
+		if (luo_enabled)
+			pr_warn("disabling because KHO is disabled\n");
+		luo_enabled = false;
+		return 0;
+	}
+
+	ret = register_kho_notifier(&luo_kho_prepare_notifier_nb);
+	if (ret) {
+		luo_enabled = false;
+		pr_warn("Faile to register with KHO [%d]\n", ret);
+	}
+
+	/*
+	 * Retrieve LUO subtree, and verify its format.  Panic in case of
+	 * exceptions, since machine devices and memory is in unpredictable
+	 * state.
+	 */
+	ret = kho_retrieve_subtree(LUO_KHO_ENTRY_NAME, &fdt_phys);
+	if (ret) {
+		if (ret != -ENOENT) {
+			panic("failed to retrieve FDT '%s' from KHO: %d\n",
+			      LUO_KHO_ENTRY_NAME, ret);
+		}
+		__luo_set_state(LIVEUPDATE_STATE_NORMAL);
+
+		return 0;
+	}
+
+	luo_fdt_in = __va(fdt_phys);
+	ret = fdt_node_check_compatible(luo_fdt_in, 0, LUO_COMPATIBLE);
+	if (ret) {
+		panic("FDT '%s' is incompatible with '%s' [%d]\n",
+		      LUO_KHO_ENTRY_NAME, LUO_COMPATIBLE, ret);
+	}
+
+	state_ptr = (u8 *)fdt_getprop(luo_fdt_in, 0, LUO_STATE, &prop_len);
+	if (!state_ptr || prop_len != sizeof(u8))
+		panic("Could not find 'state' property\n");
+
+	if (*state_ptr != LIVEUPDATE_STATE_FROZEN)
+		panic("Unexpected state value[%d]\n", *state_ptr);
+
+	__luo_set_state(LIVEUPDATE_STATE_UPDATED);
 
 	return 0;
 }
