@@ -10,6 +10,7 @@
 #include <linux/bug.h>
 #include <linux/types.h>
 #include <linux/list.h>
+#include <linux/mm_types.h>
 
 /**
  * enum liveupdate_event - Events that trigger live update callbacks.
@@ -105,6 +106,9 @@ bool liveupdate_state_updated(void);
  * Return true if machine is in normal state (i.e. no live update in progress).
  */
 bool liveupdate_state_normal(void);
+
+int liveupdate_preserve_folio(struct folio *folio);
+int liveupdate_preserve_phys(phys_addr_t phys, size_t size);
 
 #else /* CONFIG_LIVEUPDATE */
 
