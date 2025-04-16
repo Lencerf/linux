@@ -132,6 +132,10 @@ static int luo_fdt_setup(struct kho_serialization *ser)
 	if (ret)
 		goto exit_free;
 
+	ret = luo_subsystems_fdt_setup(luo_fdt_out);
+	if (ret)
+		goto exit_free;
+
 	ret = kho_preserve_phys(ser, __pa(luo_fdt_out), LUO_FDT_SIZE);
 	if (ret)
 		goto exit_free;
@@ -158,20 +162,30 @@ static void luo_fdt_destroy(struct kho_serialization *ser)
 
 static int luo_do_prepare_calls(void)
 {
-	return 0;
+	int ret;
+
+	ret = luo_do_subsystems_prepare_calls();
+
+	return ret;
 }
 
 static int luo_do_reboot_calls(void)
 {
-	return 0;
+	int ret;
+
+	ret = luo_do_subsystems_reboot_calls();
+
+	return ret;
 }
 
 static void luo_do_finish_calls(void)
 {
+	luo_do_subsystems_finish_calls();
 }
 
 static void luo_do_cancel_calls(void)
 {
+	luo_do_subsystems_cancel_calls();
 }
 
 static int __luo_prepare(struct kho_serialization *ser)
@@ -441,6 +455,7 @@ static int __init luo_startup(void)
 		panic("Unexpected state value[%d]\n", *state_ptr);
 
 	__luo_set_state(LIVEUPDATE_STATE_UPDATED);
+	luo_subsystems_startup(luo_fdt_in);
 
 	return 0;
 }
