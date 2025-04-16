@@ -13,6 +13,13 @@ int luo_prepare(void);
 int luo_reboot(void);
 int luo_finish(void);
 
+void luo_subsystems_startup(void *fdt);
+int luo_subsystems_fdt_setup(void *fdt);
+int luo_do_subsystems_prepare_calls(void);
+int luo_do_subsystems_reboot_calls(void);
+void luo_do_subsystems_finish_calls(void);
+void luo_do_subsystems_cancel_calls(void);
+
 extern const char *const luo_state_str[];
 
 /* Get the current state as a string */
