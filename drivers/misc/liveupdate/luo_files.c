@@ -286,6 +286,74 @@ exit_error:
 	return -ENOSPC;
 }
 
+static void __luo_do_files_cancel_calls(struct luo_file *boundary_file)
+{
+	unsigned long token;
+	struct luo_file *h;
+
+	xa_for_each(&luo_files_xa, token, h) {
+		if (h == boundary_file)
+			break;
+
+		if (h->fs->cancel) {
+			h->fs->cancel(h->file, h->fs->arg, h->private_data);
+			h->private_data = 0;
+		}
+	}
+}
+
+static int luo_files_commit_data_to_fdt(void)
+{
+	int files_node_offset, node_offset, ret;
+	unsigned long token;
+	char token_str[19];
+	struct luo_file *h;
+
+	files_node_offset = fdt_subnode_offset(luo_fdt_out, 0,
+					       LUO_FILES_NODE_NAME);
+	xa_for_each(&luo_files_xa, token, h) {
+		snprintf(token_str, sizeof(token_str), "%#0llx", (u64)token);
+		node_offset = fdt_subnode_offset(luo_fdt_out,
+						 files_node_offset,
+						 token_str);
+		ret = fdt_setprop(luo_fdt_out, node_offset, "data",
+				  &h->private_data, sizeof(h->private_data));
+		if (ret < 0) {
+			pr_err("Failed to set data property for token %s: %s\n",
+			       token_str, fdt_strerror(ret));
+			return -ENOSPC;
+		}
+	}
+
+	return 0;
+}
+
+static void luo_files_commit_reclaimed_to_fdt(void)
+{
+	int files_node_offset, node_offset, ret;
+	unsigned long token;
+	char token_str[19];
+	struct luo_file *h;
+	u8 reclaimed;
+
+	files_node_offset = fdt_subnode_offset(luo_fdt_out, 0,
+					       LUO_FILES_NODE_NAME);
+	xa_for_each(&luo_files_xa, token, h) {
+		snprintf(token_str, sizeof(token_str), "%#0llx", (u64)token);
+		node_offset = fdt_subnode_offset(luo_fdt_out,
+						 files_node_offset,
+						 token_str);
+		reclaimed = (u8)h->reclaimed;
+		ret = fdt_setprop(luo_fdt_out, node_offset, "reclaimed",
+				  &reclaimed, sizeof(reclaimed));
+		if (ret < 0) {
+			pr_err("Failed to set reclaimed property for token %s: %s\n",
+			       token_str, fdt_strerror(ret));
+			break;
+		}
+	}
+}
+
 /**
  * luo_do_files_prepare_calls - Calls prepare callbacks and updates FDT
  * if all prepares succeed. Handles cancellation on failure.
@@ -301,7 +369,29 @@ exit_error:
  */
 int luo_do_files_prepare_calls(void)
 {
-	return 0;
+	unsigned long token;
+	struct luo_file *h;
+	int ret;
+
+	xa_for_each(&luo_files_xa, token, h) {
+		if (h->fs->prepare) {
+			ret = h->fs->prepare(h->file, h->fs->arg,
+					     &h->private_data);
+			if (ret < 0) {
+				pr_err("Prepare failed for file token %#0llx handler '%s' [%d]\n",
+				       (u64)token, h->fs->compatible, ret);
+				__luo_do_files_cancel_calls(h);
+
+				return ret;
+			}
+		}
+	}
+
+	ret = luo_files_commit_data_to_fdt();
+	if (ret)
+		__luo_do_files_cancel_calls(NULL);
+
+	return ret;
 }
 
 /**
@@ -319,7 +409,29 @@ int luo_do_files_prepare_calls(void)
  */
 int luo_do_files_reboot_calls(void)
 {
-	return 0;
+	unsigned long token;
+	struct luo_file *h;
+	int ret;
+
+	xa_for_each(&luo_files_xa, token, h) {
+		if (h->fs->reboot) {
+			ret = h->fs->reboot(h->file, h->fs->arg,
+					    &h->private_data);
+			if (ret < 0) {
+				pr_err("Reboot callback failed for file token %#0llx handler '%s' [%d]\n",
+				       (u64)token, h->fs->compatible, ret);
+				__luo_do_files_cancel_calls(h);
+
+				return ret;
+			}
+		}
+	}
+
+	ret = luo_files_commit_data_to_fdt();
+	if (ret)
+		__luo_do_files_cancel_calls(NULL);
+
+	return ret;
 }
 
 /**
@@ -330,11 +442,19 @@ int luo_do_files_reboot_calls(void)
  */
 void luo_do_files_finish_calls(void)
 {
+	unsigned long token;
+	struct luo_file *h;
+
 	luo_files_recreate_luo_files_xa();
-	/*
-	 * XXX update the reclaimed fields in fdt_out for the debugging
-	 * purpose.
-	 */
+
+	xa_for_each(&luo_files_xa, token, h) {
+		if (h->fs->finish)
+			h->fs->finish(h->file, h->fs->arg,
+				      h->private_data,
+				      h->reclaimed);
+	}
+
+	luo_files_commit_reclaimed_to_fdt();
 }
 
 /**
@@ -348,6 +468,8 @@ void luo_do_files_finish_calls(void)
  */
 void luo_do_files_cancel_calls(void)
 {
+	__luo_do_files_cancel_calls(NULL);
+	luo_files_commit_data_to_fdt();
 }
 
 /**
