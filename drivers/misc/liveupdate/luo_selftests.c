@@ -6,7 +6,7 @@
  */
 
 /**
- * DOC: Live Update Orchestrator Selftests
+ * DOC: LUO Selftests
  *
  * We provide ioctl-based selftest interface for the LUO. It provides a
  * mechanism to test core LUO functionality, particularly the registration,
