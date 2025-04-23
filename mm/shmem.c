@@ -21,6 +21,8 @@
  * This file is released under the GPL.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/vfs.h>
@@ -41,6 +43,10 @@
 #include <linux/swapfile.h>
 #include <linux/iversion.h>
 #include <linux/unicode.h>
+#include <linux/kexec_handover.h>
+#include <linux/liveupdate.h>
+#include <linux/libfdt.h>
+#include <linux/io.h>
 #include "swap.h"
 
 static struct vfsmount *shm_mnt __ro_after_init;
@@ -5292,6 +5298,548 @@ static int shmem_error_remove_folio(struct address_space *mapping,
 {
 	return 0;
 }
+
+#if defined(CONFIG_LIVEUPDATE)
+static const char fdbox_kho_compatible[] = "fdbox,shmem-v1";
+
+// bool is_node_shmem(const void *fdt, int offset)
+// {
+// 	return fdt_node_check_compatible(fdt, offset, fdbox_kho_compatible) == 0;
+// }
+
+static long shmem_fdbox_undo_swap(struct address_space *mapping, pgoff_t index,
+				  void *old, void *arg)
+{
+	return -EOPNOTSUPP;
+}
+
+static int shmem_fdbox_undo_folio(struct address_space *mapping,
+				  struct folio *folio, void *__arg)
+{
+	void *fdt = __arg;
+	u64 phys = (u64)PFN_PHYS(folio_pfn(folio));
+	u64 index = folio_index(folio);
+	int err = 0;
+
+	folio_get(folio);
+
+	err = liveupdate_preserve_folio(folio);
+	if (err)
+		return err;
+
+	err |= fdt_appendprop(fdt, 0, "folios", &phys, sizeof(phys));
+	err |= fdt_appendprop(fdt, 0, "indices", &index, sizeof(index));
+	if (err)
+		return err;
+
+	truncate_inode_folio(mapping, folio);
+	pr_err("shmem_fdbox_undo_folio: phys=%llx, index=%llx\n", phys, index);
+	return 0;
+}
+
+static int shmem_fdbox_undo_partial_folio(struct folio *folio, pgoff_t lstart,
+					  pgoff_t lend, void *arg)
+{
+	return -EOPNOTSUPP;
+}
+
+// static const struct shmem_undo_range_ops shmem_fdbox_undo_ops = {
+// 	.undo_swap = shmem_fdbox_undo_swap,
+// 	.undo_folio = shmem_fdbox_undo_folio,
+// 	.undo_partial_folio = shmem_fdbox_undo_partial_folio,
+// };
+
+// static struct kho_mem *shmem_fdbox_kho_get_mems(struct inode *inode,
+// 						unsigned long **indicesp,
+// 						unsigned long *nr)
+// {
+// 	struct shmem_inode_info *info = SHMEM_I(inode);
+// 	unsigned long *indices __free(kvfree) = NULL;
+// 	struct kho_mem *mems __free(kvfree) = NULL;
+// 	struct shmem_fdbox_put_arg arg;
+// 	unsigned long nr_mems;
+// 	int ret, i;
+
+// 	scoped_guard(spinlock, &info->lock) {
+// 		/* TODO: Support swapped pages. Perhaps swap them back in? */
+// 		if (info->swapped)
+// 			return ERR_PTR(-EOPNOTSUPP);
+
+// 		/*
+// 		 * Estimate the size of the array using the size of the inode,
+// 		 * assuming there are no contiguous pages.
+// 		 */
+// 		nr_mems = info->alloced;
+// 	}
+
+// 	mems = kvmalloc_array(nr_mems, sizeof(*mems), GFP_KERNEL);
+// 	if (!mems)
+// 		return ERR_PTR(-ENOMEM);
+
+// 	indices = kvmalloc_array(nr_mems, sizeof(*indices), GFP_KERNEL);
+// 	if (!indices)
+// 		return ERR_PTR(-ENOMEM);
+
+// 	arg.mems = mems;
+// 	arg.indices = indices;
+// 	arg.nr_mems = nr_mems;
+// 	arg.idx = 0;
+
+// 	ret = shmem_undo_range(inode, 0, -1, false, &shmem_fdbox_undo_ops, &arg);
+// 	if (ret < 0) {
+// 		pr_err("shmem: failed to undo fdbox range: %d\n", ret);
+// 		goto err;
+// 	}
+
+// 	*nr = arg.idx;
+// 	*indicesp = no_free_ptr(indices);
+// 	return_ptr(mems);
+
+// err:
+// 	/*
+// 	 * TODO: This kills the whole file on failure to KHO. We should keep the
+// 	 * contents around for another try later. The problem is, if re-adding
+// 	 * pages fails, there would be no recovery at that point. Ideally, we
+// 	 * should first serialize the whole file, and only then remove things
+// 	 * from page cache so we are sure to never fail.
+// 	 */
+// 	for (i = 0; i < arg.idx; i++) {
+// 		struct folio *folio = page_folio(phys_to_page(mems[i].addr));
+
+// 		folio_put(folio);
+// 	}
+
+// 	/* Undo the rest of the file. This should not fail. */
+// 	WARN_ON(shmem_undo_range(inode, 0, -1, false, &shmem_default_undo_ops, NULL));
+// 	return ERR_PTR(ret);
+// }
+
+// int shmem_fdbox_kho_write(struct fdbox_fd *box_fd, void *fdt)
+// {
+// 	struct inode *inode = box_fd->file->f_inode;
+// 	unsigned long *indices __free(kvfree) = NULL;
+// 	struct kho_mem *mems __free(kvfree) = NULL;
+// 	u64 pos = box_fd->file->f_pos, size = inode->i_size;
+// 	unsigned long nr_mems, i;
+// 	int ret = 0;
+
+// 	/*
+// 	 * mems can be larger than sizeof(*mems) * nr_mems, but we should only
+// 	 * look at things in the range of 0 to nr_mems.
+// 	 */
+// 	mems = shmem_fdbox_kho_get_mems(inode, &indices, &nr_mems);
+// 	if (IS_ERR(mems))
+// 		return PTR_ERR(mems);
+
+// 	/*
+// 	 * fdbox should have already started the node. We can start adding
+// 	 * properties directly.
+// 	 */
+// 	ret |= fdt_property(fdt, "compatible", fdbox_kho_compatible,
+// 			    sizeof(fdbox_kho_compatible));
+// 	ret |= fdt_property(fdt, "pos", &pos, sizeof(u64));
+// 	ret |= fdt_property(fdt, "size",  &size, sizeof(u64));
+// 	ret |= fdt_property(fdt, "mem", mems, sizeof(*mems) * nr_mems);
+// 	ret |= fdt_property(fdt, "indices", indices, sizeof(*indices) * nr_mems);
+
+// 	if (ret) {
+// 		pr_err("shmem: failed to add properties to FDT!\n");
+// 		ret = -EINVAL;
+// 		goto err;
+// 	}
+
+// 	return 0;
+
+// err:
+// 	/*
+// 	 * TODO: This kills the whole file on failure to KHO. We should keep the
+// 	 * contents around for another try later. The problem is, if re-adding
+// 	 * pages fails, there would be no recovery at that point. Ideally, we
+// 	 * should first serialize the whole file, and only then remove things
+// 	 * from page cache so we are sure to never fail.
+// 	 */
+// 	for (i = 0; i < nr_mems; i++) {
+// 		struct folio *folio = page_folio(phys_to_page(mems[i].addr));
+
+// 		folio_put(folio);
+// 	}
+// 	return ret;
+// }
+
+// struct file *shmem_fdbox_kho_recover(const void *fdt, int offset)
+// {
+// 	struct address_space *mapping;
+// 	char pathbuf[1024] = "", *path;
+// 	const unsigned long *indices;
+// 	const struct kho_mem *mems;
+// 	unsigned long nr_mems, i = 0;
+// 	const u64 *pos, *size;
+// 	struct inode *inode;
+// 	struct file *file;
+// 	int len, ret;
+
+// 	ret = fdt_node_check_compatible(fdt, offset, fdbox_kho_compatible);
+// 	if (ret) {
+// 		pr_err("shmem: invalid compatible\n");
+// 		goto err;
+// 	}
+
+// 	mems = fdt_getprop(fdt, offset, "mem", &len);
+// 	if (!mems || len % sizeof(*mems)) {
+// 		pr_err("shmem: invalid mems property\n");
+// 		goto err;
+// 	}
+// 	nr_mems = len / sizeof(*mems);
+
+// 	indices = fdt_getprop(fdt, offset, "indices", &len);
+// 	if (!indices || len % sizeof(unsigned long)) {
+// 		pr_err("shmem: invalid indices property\n");
+// 		goto err_return;
+// 	}
+// 	if (len / sizeof(unsigned long) != nr_mems) {
+// 		pr_err("shmem: number of indices and mems do not match\n");
+// 		goto err_return;
+// 	}
+
+// 	size = fdt_getprop(fdt, offset, "size", &len);
+// 	if (!size || len != sizeof(u64)) {
+// 		pr_err("shmem: invalid size property\n");
+// 		goto err_return;
+// 	}
+
+// 	pos = fdt_getprop(fdt, offset, "pos", &len);
+// 	if (!pos || len != sizeof(u64)) {
+// 		pr_err("shmem: invalid pos property\n");
+// 		goto err_return;
+// 	}
+
+// 	/*
+// 	 * TODO: This sets UID/GID, cgroup accounting to root. Should this
+// 	 * be given to the first user that maps the FD instead?
+// 	 */
+// 	file = shmem_file_setup(fdt_get_name(fdt, offset, NULL), 0,
+// 				VM_NORESERVE);
+// 	if (IS_ERR(file)) {
+// 		pr_err("shmem: failed to setup file\n");
+// 		goto err_return;
+// 	}
+
+// 	inode = file->f_inode;
+// 	mapping = inode->i_mapping;
+// 	vfs_setpos(file, *pos, MAX_LFS_FILESIZE);
+
+// 	for (; i < nr_mems; i++) {
+// 		struct folio *folio;
+// 		void *va;
+
+// 		if (mems[i].size != PAGE_SIZE) {
+// 			pr_err("shmem: unknown kho_mem size %llx. Expected %lx\n",
+// 			       mems[i].size, PAGE_SIZE);
+// 			goto err_return;
+// 		}
+
+// 		va = kho_claim_mem(&mems[i]);
+// 		folio = virt_to_folio(va);
+
+// 		/* Set up the folio for insertion. */
+
+// 		/*
+// 		 * TODO: This breaks falloc-ed folios since now they get marked
+// 		 * uptodate when they might not actually be zeroed out yet. Need
+// 		 * a way to distinguish falloc-ed folios.
+// 		 */
+// 		folio_mark_uptodate(folio);
+// 		folio_mark_dirty(folio);
+
+// 		/*
+// 		 * TODO: Should find a way to unify this and
+// 		 * shmem_alloc_and_add_folio().
+// 		 */
+// 		__folio_set_locked(folio);
+// 		__folio_set_swapbacked(folio);
+
+// 		ret = mem_cgroup_charge(folio, NULL, mapping_gfp_mask(mapping));
+// 		if (ret) {
+// 			folio_unlock(folio);
+// 			folio_put(folio);
+// 			fput(file);
+// 			pr_err("shmem: failed to charge folio index %lu\n", i);
+// 			goto err_return_next;
+// 		}
+
+// 		ret = shmem_add_to_page_cache(folio, mapping, indices[i], NULL,
+// 					      mapping_gfp_mask(mapping));
+// 		if (ret) {
+// 			folio_unlock(folio);
+// 			folio_put(folio);
+// 			fput(file);
+// 			pr_err("shmem: failed to add to page cache folio index %lu\n", i);
+// 			goto err_return_next;
+// 		}
+
+// 		ret = shmem_inode_acct_blocks(inode, 1);
+// 		if (ret) {
+// 			folio_unlock(folio);
+// 			folio_put(folio);
+// 			fput(file);
+// 			pr_err("shmem: failed to account folio index %lu\n", i);
+// 			goto err_return_next;
+// 		}
+
+// 		shmem_recalc_inode(inode, 1, 0);
+// 		folio_add_lru(folio);
+// 		folio_unlock(folio);
+// 		folio_put(folio);
+// 	}
+
+// 	inode->i_size = *size;
+
+// 	return file;
+
+// err_return:
+// 	kho_return_mem(mems + i);
+// err_return_next:
+// 	for (i = i + 1; i < nr_mems; i++)
+// 		kho_return_mem(mems + i);
+// err:
+// 	ret = fdt_get_path(fdt, offset, pathbuf, sizeof(pathbuf));
+// 	if (ret)
+// 		path = "unknown";
+// 	else
+// 		path = pathbuf;
+
+// 	pr_err("shmem: error when recovering KHO node '%s'\n", path);
+// 	return NULL;
+// }
+
+static const struct shmem_undo_range_ops shmem_luo_undo_ops = {
+	.undo_swap = shmem_fdbox_undo_swap,
+	.undo_folio = shmem_fdbox_undo_folio,
+	.undo_partial_folio = shmem_fdbox_undo_partial_folio,
+};
+
+static int shmem_luo_file_preserve_folios(struct inode *inode, void *fdt)
+{
+	int ret = 0;
+
+	ret = shmem_undo_range(inode, 0, -1, false, &shmem_luo_undo_ops, fdt);
+	if (ret < 0) {
+		pr_err("shmem: failed to undo fdbox range: %d\n", ret);
+		goto err;
+	}
+	pr_err("shmem_undo_range: done");
+	return 0;
+
+err:
+	/*
+	 * TODO: This kills the whole file on failure to KHO. We should keep the
+	 * contents around for another try later. The problem is, if re-adding
+	 * pages fails, there would be no recovery at that point. Ideally, we
+	 * should first serialize the whole file, and only then remove things
+	 * from page cache so we are sure to never fail.
+	 */
+	// for (i = 0; i < arg.idx; i++) {
+	// 	struct folio *folio = page_folio(phys_to_page(mems[i].addr));
+
+	// 	folio_put(folio);
+	// }
+
+	// /* Undo the rest of the file. This should not fail. */
+	// WARN_ON(shmem_undo_range(inode, 0, -1, false, &shmem_default_undo_ops, NULL));
+	pr_err("cannot handle\n");
+	return ret;
+}
+
+static int shmem_luo_file_prepare(struct file *file, void *arg, u64 *data) {
+	int err = 0;
+	struct page *fdt_page = NULL;
+	void *fdt = NULL;
+	u64 pos = file->f_pos;
+	u64 size = file->f_inode->i_size;
+
+	fdt_page = alloc_page(GFP_KERNEL);
+	if (!fdt_page) {
+		err = -ENOMEM;
+		goto err;
+	}
+
+	fdt = page_to_virt(fdt_page);
+	err = fdt_create_empty_tree(fdt, PAGE_SIZE);
+	if (err) {
+		err = -EINVAL;
+		goto err;
+	}
+
+	shmem_luo_file_preserve_folios(file->f_inode, fdt);
+
+	fdt_setprop(fdt, 0, "pos", &pos, sizeof(pos));
+	fdt_setprop(fdt, 0, "size", &size, sizeof(size));
+
+	liveupdate_preserve_folio(page_folio(fdt_page));
+
+	*data = (u64)virt_to_phys(fdt);
+	return 0;
+
+err:
+	if (fdt_page)
+		free_page((unsigned long)fdt_page);
+	return err;
+}
+
+
+static int shmem_luo_file_retrieve(void *arg, u64 data, struct file **file_p) {
+	const void *fdt = phys_to_virt((phys_addr_t)data);
+	const u64 *folios, *indices;
+	int len_folios, len;
+	int err = 0;
+	const u64 *pos, *size;
+	struct file *file;
+	int i = 0;
+	struct inode *inode;
+	struct address_space *mapping;
+	int ret;
+
+	folios = fdt_getprop(fdt, 0, "folios", &len_folios);
+	if (!folios || len_folios % sizeof(*folios)) {
+		err = -EINVAL;
+		goto out;
+	}
+	indices = fdt_getprop(fdt, 0, "indices", &len);
+	if (!indices || len % sizeof(*indices)) {
+		err = -EINVAL;
+		goto out;
+	}
+	if (len != len_folios) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	size = fdt_getprop(fdt, 0, "size", &len);
+	if (!size || len != sizeof(u64)) {
+		pr_err("shmem: invalid size property\n");
+		goto out;
+	}
+
+	pos = fdt_getprop(fdt, 0, "pos", &len);
+	if (!pos || len != sizeof(u64)) {
+		pr_err("shmem: invalid pos property\n");
+		goto out;
+	}
+
+	/*
+	 * TODO: This sets UID/GID, cgroup accounting to root. Should this
+	 * be given to the first user that maps the FD instead?
+	 */
+	file = shmem_file_setup("", 0, VM_NORESERVE);
+
+	if (IS_ERR(file)) {
+		pr_err("shmem: failed to setup file\n");
+		goto out;
+	}
+
+	inode = file->f_inode;
+	mapping = inode->i_mapping;
+	vfs_setpos(file, *pos, MAX_LFS_FILESIZE);
+
+	for (; i < len_folios/sizeof(*folios); i++) {
+		struct folio *folio;
+
+		// if (mems[i].size != PAGE_SIZE) {
+		// 	pr_err("shmem: unknown kho_mem size %llx. Expected %lx\n",
+		// 	       mems[i].size, PAGE_SIZE);
+		// 	goto err_return;
+		// }
+
+		folio = kho_restore_folio((phys_addr_t)folios[i]);
+
+		/* Set up the folio for insertion. */
+
+		/*
+		 * TODO: This breaks falloc-ed folios since now they get marked
+		 * uptodate when they might not actually be zeroed out yet. Need
+		 * a way to distinguish falloc-ed folios.
+		 */
+		folio_mark_uptodate(folio);
+		folio_mark_dirty(folio);
+
+		/*
+		 * TODO: Should find a way to unify this and
+		 * shmem_alloc_and_add_folio().
+		 */
+		__folio_set_locked(folio);
+		__folio_set_swapbacked(folio);
+
+		ret = mem_cgroup_charge(folio, NULL, mapping_gfp_mask(mapping));
+		if (ret) {
+			folio_unlock(folio);
+			folio_put(folio);
+			fput(file);
+			pr_err("shmem: failed to charge folio index %d\n", i);
+			goto out;
+		}
+
+		ret = shmem_add_to_page_cache(folio, mapping, indices[i], NULL,
+					      mapping_gfp_mask(mapping));
+		if (ret) {
+			folio_unlock(folio);
+			folio_put(folio);
+			fput(file);
+			pr_err("shmem: failed to add to page cache folio index %d\n", i);
+			goto out;
+		}
+
+		ret = shmem_inode_acct_blocks(inode, 1);
+		if (ret) {
+			folio_unlock(folio);
+			folio_put(folio);
+			fput(file);
+			pr_err("shmem: failed to account folio index %d\n", i);
+			goto out;
+		}
+
+		shmem_recalc_inode(inode, 1, 0);
+		folio_add_lru(folio);
+		folio_unlock(folio);
+		folio_put(folio);
+	}
+
+	inode->i_size = *size;
+	*file_p = file;
+
+out:
+
+	return err;
+}
+
+static bool shmem_luo_file_can_preserve(struct file *file, void *arg) {
+	pr_err("shmem_luo_file_can_preserve = %d\n", shmem_file(file));
+	// not hugetlb
+	return shmem_file(file);
+}
+
+
+static struct liveupdate_filesystem shmem_luo_fs_ops = {
+	.prepare = shmem_luo_file_prepare,
+	.retrieve = shmem_luo_file_retrieve,
+	.can_preserve = shmem_luo_file_can_preserve,
+	.compatible = "shmem-v1",
+};
+
+static int __init shmem_luo_init(void)
+{
+	int error;
+
+	error = liveupdate_register_filesystem(&shmem_luo_fs_ops);
+	if (error)
+		pr_err("Could not register luo filesystem handler: %d\n", error);
+
+	pr_err("registerred shmem_luo_fs_ops\n");
+
+	return error;
+}
+late_initcall(shmem_luo_init);
+
+#endif /* CONFIG_LIVEUPDATE */
 
 static const struct address_space_operations shmem_aops = {
 	.writepage	= shmem_writepage,

@@ -245,6 +245,7 @@ int luo_files_fdt_setup(void *fdt)
 	char token_str[19];
 	u8 reclaimed = 0;
 
+	pr_err("luo_files_fdt_setup 1\n");
 	ret = fdt_add_subnode(fdt, 0, LUO_FILES_NODE_NAME);
 	if (ret < 0)
 		goto exit_error;
@@ -255,6 +256,7 @@ int luo_files_fdt_setup(void *fdt)
 	if (ret < 0)
 		goto exit_error;
 
+	pr_err("luo_files_fdt_setup 2, xa=%llx\n", (u64)&luo_files_xa);
 	xa_for_each(&luo_files_xa, token, h) {
 		snprintf(token_str, sizeof(token_str), "%#0llx", (u64)token);
 
@@ -268,6 +270,7 @@ int luo_files_fdt_setup(void *fdt)
 		if (ret < 0)
 			goto exit_error;
 
+		pr_err("luo_files_fdt_setup 3\n");
 		ret = fdt_setprop(fdt, node_offset, "reclaimed",
 				  &reclaimed, sizeof(reclaimed));
 		if (ret < 0)
@@ -533,6 +536,7 @@ int luo_register_file(u64 *tokenp, struct file *file)
 		}
 		fs->refcnt++;
 		*tokenp = token;
+		pr_err("preserved fd with token %llx\n", token);
 	} else {
 		kfree(luo_file);
 	}
@@ -622,6 +626,7 @@ int luo_retrieve_file(u64 token, struct file **file)
 	luo_file = xa_load(&luo_files_xa, token);
 	if (luo_file && !luo_file->reclaimed) {
 		luo_file->reclaimed = true;
+		pr_err("retrieving %llx\n", luo_file->private_data);
 		ret = luo_file->fs->retrieve(luo_file->fs->arg,
 					     luo_file->private_data,
 					     file);
