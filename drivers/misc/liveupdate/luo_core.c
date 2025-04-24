@@ -64,7 +64,6 @@ const char *const luo_state_str[] = {
 
 bool luo_enabled;
 
-static struct kho_serialization *luo_kho_ser;
 static void *luo_fdt_out;
 static void *luo_fdt_in;
 /* LUO FDT size is 2M, if needed can be expanded */
@@ -141,7 +140,7 @@ static int luo_fdt_setup(struct kho_serialization *ser)
 	if (ret)
 		goto exit_free;
 
-	ret = kho_preserve_phys(ser, __pa(luo_fdt_out), LUO_FDT_SIZE);
+	ret = kho_preserve_phys(__pa(luo_fdt_out), LUO_FDT_SIZE);
 	if (ret)
 		goto exit_free;
 
@@ -228,9 +227,7 @@ static int __luo_prepare(struct kho_serialization *ser)
 	if (ret)
 		goto exit_unlock;
 
-	luo_kho_ser = ser;
 	ret = luo_do_prepare_calls();
-	luo_kho_ser = NULL;
 	if (ret)
 		goto exit_unlock;
 
@@ -564,42 +561,3 @@ bool liveupdate_enabled(void)
 	return luo_enabled;
 }
 EXPORT_SYMBOL_GPL(liveupdate_enabled);
-
-/**
- * liveupdate_preserve_folio - Preserve folio during prepare phase
- * @folio: Memory to be preserve.
- *
- * Preserve a folio during LUO prepare phase.
- *
- * @return 0 on success, or negative error code
- */
-int liveupdate_preserve_folio(struct folio *folio)
-{
-	if (!luo_kho_ser) {
-		pr_err("Memory preservation is allowed only during prepare phase\n");
-		return -EINVAL;
-	}
-
-	return kho_preserve_folio(luo_kho_ser, folio);
-}
-EXPORT_SYMBOL_GPL(liveupdate_preserve_folio);
-
-/**
- * liveupdate_preserve_phys - Preserve physical address during prepare phase
- * @phys: Start address of the physical region.
- * @size: Length of the physical region.
- *
- * Preserve a physical range from @phys to @size during prepare phase.
- *
- * @return 0 on success, or negative error code
- */
-int liveupdate_preserve_phys(phys_addr_t phys, size_t size)
-{
-	if (!luo_kho_ser) {
-		pr_err("Memory preservation is allowed only during prepare phase\n");
-		return -EINVAL;
-	}
-
-	return kho_preserve_phys(luo_kho_ser, phys, size);
-}
-EXPORT_SYMBOL_GPL(liveupdate_preserve_phys);

@@ -148,7 +148,6 @@ static int __kho_preserve_order(struct kho_mem_track *track, unsigned long pfn,
 
 /**
  * kho_preserve_folio - preserve a folio across kexec.
- * @ser: serialization control object passed by KHO notifiers.
  * @folio: folio to preserve.
  *
  * Instructs KHO to preserve the whole folio across kexec. The order
@@ -156,18 +155,20 @@ static int __kho_preserve_order(struct kho_mem_track *track, unsigned long pfn,
  *
  * Return: 0 on success, error code on failure
  */
-int kho_preserve_folio(struct kho_serialization *ser, struct folio *folio)
+int kho_preserve_folio(struct folio *folio)
 {
 	const unsigned long pfn = folio_pfn(folio);
 	const unsigned int order = folio_order(folio);
 
-	return __kho_preserve_order(&ser->track, pfn, order);
+	if (kho_out.finalized)
+		return -EBUSY;
+
+	return __kho_preserve_order(&kho_out.ser.track, pfn, order);
 }
 EXPORT_SYMBOL_GPL(kho_preserve_folio);
 
 /**
  * kho_preserve_phys - preserve a physically contiguous range across kexec.
- * @ser: serialization control object passed by KHO notifiers.
  * @phys: physical address of the range.
  * @size: size of the range.
  *
@@ -176,14 +177,17 @@ EXPORT_SYMBOL_GPL(kho_preserve_folio);
  *
  * Return: 0 on success, error code on failure
  */
-int kho_preserve_phys(struct kho_serialization *ser, phys_addr_t phys,
-		      size_t size)
+int kho_preserve_phys(phys_addr_t phys, size_t size)
 {
 	unsigned long pfn = PHYS_PFN(phys);
 	unsigned long failed_pfn = 0;
 	const unsigned long start_pfn = pfn;
 	const unsigned long end_pfn = PHYS_PFN(phys + size);
 	int err = 0;
+	struct kho_mem_track *track = &kho_out.ser.track;
+
+	if (kho_out.finalized)
+		return -EBUSY;
 
 	if (!PAGE_ALIGNED(phys) || !PAGE_ALIGNED(size))
 		return -EINVAL;
@@ -192,7 +196,7 @@ int kho_preserve_phys(struct kho_serialization *ser, phys_addr_t phys,
 		const unsigned int order =
 			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
 
-		err = __kho_preserve_order(&ser->track, pfn, order);
+		err = __kho_preserve_order(track, pfn, order);
 		if (err) {
 			failed_pfn = pfn;
 			break;
@@ -202,7 +206,7 @@ int kho_preserve_phys(struct kho_serialization *ser, phys_addr_t phys,
 	}
 
 	if (err)
-		__kho_unpreserve(&ser->track, start_pfn, failed_pfn);
+		__kho_unpreserve(track, start_pfn, failed_pfn);
 
 	return err;
 }
@@ -698,7 +702,7 @@ int __kho_finalize(void)
 	if (err)
 		goto abort;
 
-	err = kho_preserve_folio(&kho_out.ser, page_folio(kho_out.ser.fdt));
+	err = kho_preserve_folio(page_folio(kho_out.ser.fdt));
 	if (err)
 		goto abort;
 
