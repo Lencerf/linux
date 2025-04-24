@@ -98,26 +98,33 @@ static void *xa_load_or_alloc(struct xarray *xa, unsigned long index, size_t sz)
 	return elm;
 }
 
-static void __kho_unpreserve(struct kho_mem_track *track, unsigned long pfn,
-			     unsigned long end_pfn)
+static void __kho_unpreserve_order(struct kho_mem_track *track, unsigned long pfn,
+				   unsigned int order)
 {
 	struct kho_mem_phys_bits *bits;
 	struct kho_mem_phys *physxa;
+	const unsigned long pfn_high = pfn >> order;
+
+	physxa = xa_load(&track->orders, order);
+	if (!physxa)
+		return;
+
+	bits = xa_load(&physxa->phys_bits, pfn_high / PRESERVE_BITS);
+	if (!bits)
+		return;
+
+	clear_bit(pfn_high % PRESERVE_BITS, bits->preserve);
+}
+
+static void __kho_unpreserve(struct kho_mem_track *track, unsigned long pfn,
+			     unsigned long end_pfn)
+{
+	unsigned int order;
 
 	while (pfn < end_pfn) {
-		const unsigned int order =
-			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
-		const unsigned long pfn_high = pfn >> order;
+		order = min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
 
-		physxa = xa_load(&track->orders, order);
-		if (!physxa)
-			continue;
-
-		bits = xa_load(&physxa->phys_bits, pfn_high / PRESERVE_BITS);
-		if (!bits)
-			continue;
-
-		clear_bit(pfn_high % PRESERVE_BITS, bits->preserve);
+		__kho_unpreserve_order(track, pfn, order);
 
 		pfn += 1 << order;
 	}
@@ -166,6 +173,27 @@ int kho_preserve_folio(struct folio *folio)
 	return __kho_preserve_order(&kho_out.ser.track, pfn, order);
 }
 EXPORT_SYMBOL_GPL(kho_preserve_folio);
+
+/**
+ * kho_unpreserve_folio - unpreserve a folio.
+ * @folio: folio to preserve.
+ *
+ * Instructs KHO to unpreserve a folio that was preserved by
+ * kho_preserve_folio() before.
+ *
+ * Return: 0 on success, error code on failure
+ */
+ int kho_unpreserve_folio(struct folio *folio)
+ {
+	 const unsigned long pfn = folio_pfn(folio);
+	 const unsigned int order = folio_order(folio);
+
+	 if (kho_out.finalized)
+		 return -EBUSY;
+
+	 return __kho_preserve_order(&kho_out.ser.track, pfn, order);
+ }
+ EXPORT_SYMBOL_GPL(kho_unpreserve_folio);
 
 /**
  * kho_preserve_phys - preserve a physically contiguous range across kexec.
