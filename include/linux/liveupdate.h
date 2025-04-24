@@ -160,9 +160,6 @@ bool liveupdate_state_updated(void);
  */
 bool liveupdate_state_normal(void);
 
-int liveupdate_preserve_folio(struct folio *folio);
-int liveupdate_preserve_phys(phys_addr_t phys, size_t size);
-
 int liveupdate_register_subsystem(struct liveupdate_subsystem *h);
 int liveupdate_unregister_subsystem(struct liveupdate_subsystem *h);
 int liveupdate_get_subsystem_data(struct liveupdate_subsystem *h, u64 *data);

@@ -2502,10 +2502,10 @@ static int reserve_mem_kho_finalize(struct kho_serialization *ser)
 	for (i = 0; i < reserved_mem_count; i++) {
 		struct reserve_mem_table *map = &reserved_mem_table[i];
 
-		err |= kho_preserve_phys(ser, map->start, map->size);
+		err |= kho_preserve_phys(map->start, map->size);
 	}
 
-	err |= kho_preserve_folio(ser, page_folio(kho_fdt));
+	err |= kho_preserve_folio(page_folio(kho_fdt));
 	err |= kho_add_subtree(ser, MEMBLOCK_KHO_FDT, page_to_virt(kho_fdt));
 
 	return notifier_from_errno(err);

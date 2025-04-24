@@ -52,6 +52,7 @@
 
 #include <linux/errno.h>
 #include <linux/gfp.h>
+#include <linux/kexec_handover.h>
 #include <linux/liveupdate.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
@@ -75,7 +76,7 @@ static int luo_subsystem_prepare(void *arg, u64 *data)
 	unsigned long phys_addr = __pa(luo_subsystems[i].data);
 	int ret;
 
-	ret = liveupdate_preserve_phys(phys_addr, PAGE_SIZE);
+	ret = kho_preserve_phys(phys_addr, PAGE_SIZE);
 	if (ret)
 		return ret;
 
