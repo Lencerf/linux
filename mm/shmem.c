@@ -5349,7 +5349,7 @@ static int shmem_luo_preserve_folios(struct inode *inode, void *fdt)
 	int len;
 
 	ret = shmem_undo_range(inode, 0, -1, false, &shmem_luo_undo_ops, fdt);
-	if (ret < 0) {
+	if (ret) {
 		pr_err("shmem: failed to undo range: %d\n", ret);
 		goto err;
 	}
@@ -5388,39 +5388,37 @@ static int shmem_luo_prepare(struct file *file, void *arg, u64 *data) {
 	u64 size = file->f_inode->i_size;
 
 	fdt_page = alloc_page(GFP_KERNEL);
-	if (!fdt_page) {
-		err = -ENOMEM;
-		goto err;
-	}
+	if (!fdt_page)
+		return -ENOMEM;
 
 	fdt = page_to_virt(fdt_page);
 	err = fdt_create_empty_tree(fdt, PAGE_SIZE);
-	if (err) {
-		err = -EINVAL;
-		goto err;
-	}
-
-	err = shmem_luo_preserve_folios(file->f_inode, fdt);
 	if (err)
-		goto err;
+		goto free;
 
 	err = fdt_setprop(fdt, 0, "pos", &pos, sizeof(pos));
 	if (err)
-		goto err;
+		goto free;
+
 	err = fdt_setprop(fdt, 0, "size", &size, sizeof(size));
 	if (err)
-		goto err;
+		goto free;
 
 	err = kho_preserve_folio(page_folio(fdt_page));
 	if (err)
-		goto err;
+		goto free;
+
+	err = shmem_luo_preserve_folios(file->f_inode, fdt);
+	if (err)
+		goto unpreserve;
 
 	*data = (u64)virt_to_phys(fdt);
 	return 0;
 
-err:
-	if (fdt_page)
-		free_page((unsigned long)fdt_page);
+unpreserve:
+	kho_unpreserve_folio(page_folio(fdt_page));
+free:
+	free_page((unsigned long)fdt_page);
 	return err;
 }
 
@@ -5429,37 +5427,64 @@ static void shmem_luo_cancel(struct file *file, void *arg, u64 data) {
 }
 
 static void shmem_luo_finish(struct file *file, void *arg, u64 data, bool reclaimed) {
+	pr_err("shmem_luo_finish done\n");
+	return;
+// 	const void *fdt = phys_to_virt((phys_addr_t)data);
+// 	const u64 (*folios)[2];
+// 	int len;
+// 	int i;
 
+// 	if (reclaimed)
+// 		goto put_fdt;
+
+// 	folios = fdt_getprop(fdt, 0, "folios", &len);
+// 	if (!folios || len % sizeof(*folios)) {
+// 		pr_err("invalid 'folios' property\n");
+// 		goto put_fdt;
+// 	}
+
+// 	for (i = 0; i < len_folios / sizeof(*folios); i++) {
+// 		folio = kho_restore_folio(folios[i][0]);
+// 		if (folio)
+// 			folio_put(folio);
+// 		else
+// 			pr_err("invalid folio address: %llx\n", folios[i][0]);
+// 	}
+
+// put_fdt:
+// 	folio_put(virt_to_folio(fdt));
 }
 
 static int shmem_luo_retrieve(void *arg, u64 data, struct file **file_p) {
 	const void *fdt = phys_to_virt((phys_addr_t)data);
 	const u64 (*folios)[2];
 	int len_folios, len;
-	int err = 0;
+	int ret = 0;
 	const u64 *pos, *size;
 	struct file *file;
 	int i = 0;
 	struct inode *inode;
 	struct address_space *mapping;
-	int ret;
+	struct folio *folio;
 
 	folios = fdt_getprop(fdt, 0, "folios", &len_folios);
 	if (!folios || len_folios % sizeof(*folios)) {
-		err = -EINVAL;
-		goto out;
+		pr_err("invalid 'folios' property\n");
+		return -EINVAL;
 	}
 
 	size = fdt_getprop(fdt, 0, "size", &len);
 	if (!size || len != sizeof(u64)) {
-		pr_err("shmem: invalid size property\n");
-		goto out;
+		pr_err("invalid 'size' property\n");
+		ret = -EINVAL;
+		goto free;
 	}
 
 	pos = fdt_getprop(fdt, 0, "pos", &len);
 	if (!pos || len != sizeof(u64)) {
-		pr_err("shmem: invalid pos property\n");
-		goto out;
+		pr_err("invalid 'pos' property\n");
+		ret = -EINVAL;
+		goto free;
 	}
 
 	/*
@@ -5469,19 +5494,23 @@ static int shmem_luo_retrieve(void *arg, u64 data, struct file **file_p) {
 	file = shmem_file_setup("", 0, VM_NORESERVE);
 
 	if (IS_ERR(file)) {
-		pr_err("shmem: failed to setup file\n");
-		goto out;
+		ret = PTR_ERR(file);
+		pr_err("failed to setup file: %d\n", ret);
+		goto free;
 	}
 
 	inode = file->f_inode;
 	mapping = inode->i_mapping;
 	vfs_setpos(file, *pos, MAX_LFS_FILESIZE);
 
-	for (; i < len_folios/sizeof(*folios); i++) {
-		struct folio *folio;
+	for (; i < len_folios / sizeof(*folios); i++) {
 		u64 index;
 
 		folio = kho_restore_folio(folios[i][0]);
+		if (!folio) {
+			pr_err("invalid folio physical address: %llx\n", folios[i][0]);
+			goto put_file;
+		}
 		index = folios[i][1];
 
 		/* Set up the folio for insertion. */
@@ -5503,30 +5532,21 @@ static int shmem_luo_retrieve(void *arg, u64 data, struct file **file_p) {
 
 		ret = mem_cgroup_charge(folio, NULL, mapping_gfp_mask(mapping));
 		if (ret) {
-			folio_unlock(folio);
-			folio_put(folio);
-			fput(file);
-			pr_err("shmem: failed to charge folio index %d\n", i);
-			goto out;
+			pr_err("shmem: failed to charge folio index %d: %d\n", i, ret);
+			goto unlock_folio;
 		}
 
 		ret = shmem_add_to_page_cache(folio, mapping, index, NULL,
 					      mapping_gfp_mask(mapping));
 		if (ret) {
-			folio_unlock(folio);
-			folio_put(folio);
-			fput(file);
-			pr_err("shmem: failed to add to page cache folio index %d\n", i);
-			goto out;
+			pr_err("shmem: failed to add to page cache folio index %d: %d\n", i, ret);
+			goto unlock_folio;
 		}
 
 		ret = shmem_inode_acct_blocks(inode, 1);
 		if (ret) {
-			folio_unlock(folio);
-			folio_put(folio);
-			fput(file);
-			pr_err("shmem: failed to account folio index %d\n", i);
-			goto out;
+			pr_err("shmem: failed to account folio index %d: %d\n", i, ret);
+			goto unlock_folio;
 		}
 
 		shmem_recalc_inode(inode, 1, 0);
@@ -5537,10 +5557,22 @@ static int shmem_luo_retrieve(void *arg, u64 data, struct file **file_p) {
 
 	inode->i_size = *size;
 	*file_p = file;
+	return 0;
 
-out:
+unlock_folio:
+	folio_unlock(folio);
+	folio_put(folio);
+put_file:
+	fput(file);
+	i++;
+free:
+	for (; i < len_folios / sizeof(*folios); i++) {
+		folio = kho_restore_folio(folios[i][0]);
+		if (folio)
+			folio_put(folio);
+	}
 
-	return err;
+	return ret;
 }
 
 static bool shmem_luo_can_preserve(struct file *file, void *arg) {

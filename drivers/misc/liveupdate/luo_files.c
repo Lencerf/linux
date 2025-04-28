@@ -340,15 +340,18 @@ static void luo_files_commit_reclaimed_to_fdt(void)
 	struct luo_file *h;
 	u8 reclaimed;
 
+	// pr_err("luo_files_commit_reclaimed_to_fdt start\n");
 	files_node_offset = fdt_subnode_offset(luo_fdt_in, 0,
 					       LUO_FILES_NODE_NAME);
+	// pr_err("files_node_offset=%llx\n", files_node_offset);
 	xa_for_each(&luo_files_xa_in, token, h) {
 		snprintf(token_str, sizeof(token_str), "%#0llx", (u64)token);
-		node_offset = fdt_subnode_offset(luo_fdt_out,
+		node_offset = fdt_subnode_offset(luo_fdt_in,
 						 files_node_offset,
 						 token_str);
+		// pr_err("node_offset=%llx\n", node_offset);
 		reclaimed = (u8)h->reclaimed;
-		ret = fdt_setprop(luo_fdt_out, node_offset, "reclaimed",
+		ret = fdt_setprop(luo_fdt_in, node_offset, "reclaimed",
 				  &reclaimed, sizeof(reclaimed));
 		if (ret < 0) {
 			pr_err("Failed to set reclaimed property for token %s: %s\n",

@@ -1242,6 +1242,8 @@ static void virtio_fs_send_forget(struct fuse_iqueue *fiq, struct fuse_forget_li
 	struct virtio_fs_vq *fsvq = &fs->vqs[VQ_HIPRIO];
 	u64 unique = fuse_get_unique(fiq);
 
+	// dump_stack();
+
 	/* Allocate a buffer for the request */
 	forget = kmalloc(sizeof(*forget), GFP_NOFS | __GFP_NOFAIL);
 	req = &forget->req;

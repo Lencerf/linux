@@ -181,6 +181,7 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
 	args->in_args[1].value = name->name;
 	args->in_args[2].size = 1;
 	args->in_args[2].value = "";
+	// printk("lookup name=%s\n", name->name);
 	args->out_numargs = 1;
 	args->out_args[0].size = sizeof(struct fuse_entry_out);
 	args->out_args[0].value = outarg;

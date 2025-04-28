@@ -126,9 +126,13 @@ static bool fuse_emit(struct file *file, struct dir_context *ctx,
 static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
 			 struct dir_context *ctx)
 {
+	// dump_stack();
 	while (nbytes >= FUSE_NAME_OFFSET) {
+		// printk("parse_dirfile: nbytes=%d, FUSE_NAME_OFFSET=%d\n", nbytes, FUSE_NAME_OFFSET);
 		struct fuse_dirent *dirent = (struct fuse_dirent *) buf;
+		// printk("ino=%llu off=%llu namelen=%lu type=%lu\n", dirent->ino, dirent->off, dirent->namelen, dirent->type);
 		size_t reclen = FUSE_DIRENT_SIZE(dirent);
+		// printk("parse_dirfile: reclen=%d, namelen=%d, name=%s\n", reclen, dirent->namelen, dirent->name);
 		if (!dirent->namelen || dirent->namelen > FUSE_NAME_MAX)
 			return -EIO;
 		if (reclen > nbytes)
@@ -362,6 +366,7 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
 	locked = fuse_lock_inode(inode);
 	res = fuse_simple_request(fm, &ap->args);
 	fuse_unlock_inode(inode, locked);
+	// printk("fuse_simple_request res=%d\n", res);
 	if (res >= 0) {
 		if (!res) {
 			struct fuse_file *ff = file->private_data;
