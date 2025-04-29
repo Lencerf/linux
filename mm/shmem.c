@@ -23,6 +23,8 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/types.h>
+#include <linux/printk.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/vfs.h>
@@ -47,6 +49,9 @@
 #include <linux/liveupdate.h>
 #include <linux/libfdt.h>
 #include <linux/io.h>
+#include <linux/xarray.h>
+#include <linux/errno.h>
+#include <linux/pfn.h>
 #include "swap.h"
 
 static struct vfsmount *shm_mnt __ro_after_init;
@@ -5302,82 +5307,92 @@ static int shmem_error_remove_folio(struct address_space *mapping,
 #if defined(CONFIG_LIVEUPDATE)
 static const char shmem_luo_compatible[] = "shmem-v1";
 
-static long shmem_luo_undo_swap(struct address_space *mapping, pgoff_t index,
-				  void *old, void *arg)
-{
-	return -EOPNOTSUPP;
+static void shmem_luo_unpreserve_folios(const void *fdt) {
+	const u64 (*folios)[2];
+	int len;
+	int i;
+
+	folios = fdt_getprop(fdt, 0, "folios", &len);
+	if (!folios)
+		return;
+
+	for (i = 0; i < len / sizeof(*folios); i++) {
+		phys_addr_t phys = folios[i][0];
+		struct folio *f = page_folio(phys_to_page(phys));
+
+		kho_unpreserve_folio(f);
+		folio_put(f);
+	}
 }
 
-static int shmem_luo_undo_folio(struct address_space *mapping,
-				  struct folio *folio, void *__arg)
-{
-	void *fdt = __arg;
-	int err = 0;
-	u64 phys_index[2] = {PFN_PHYS(folio_pfn(folio)), folio_index(folio)};
+static int shmem_luo_preserve_folio(void *fdt, struct folio* f) {
+	int err;
+	u64 phys = PFN_PHYS(folio_pfn(f));
+	u64 index = folio_index(f);
 
-	err = kho_preserve_folio(folio);
+	pr_err("to preserve: folio=%llx, index=%llu\n", phys, index);
+
+	folio_get(f);
+	err = kho_preserve_folio(f);
 	if (err)
-		return err;
-	err = fdt_appendprop(fdt, 0, "folios", phys_index, sizeof(phys_index));
-	if (err) {
-		kho_unpreserve_folio(folio);
-		return err;
-	}
+		goto put;
 
-	folio_get(folio);
-	truncate_inode_folio(mapping, folio);
+	u64 val[2] = {phys, index};
+	err = fdt_appendprop(fdt, 0, "folios", val, sizeof(val));
+	if (err)
+		goto unpreserve;
 
 	return 0;
-}
 
-static int shmem_luo_undo_partial_folio(struct folio *folio, pgoff_t lstart,
-					  pgoff_t lend, void *arg)
-{
-	return -EOPNOTSUPP;
+unpreserve:
+	kho_unpreserve_folio(f);
+put:
+	folio_put(f);
+	return err;
 }
-
-static const struct shmem_undo_range_ops shmem_luo_undo_ops = {
-	.undo_swap = shmem_luo_undo_swap,
-	.undo_folio = shmem_luo_undo_folio,
-	.undo_partial_folio = shmem_luo_undo_partial_folio,
-};
 
 static int shmem_luo_preserve_folios(struct inode *inode, void *fdt)
 {
-	int ret = 0;
-	const u64 (*folios)[2];
-	int len;
+	int err = 0;
+	pgoff_t start = 0;
+	const pgoff_t end = -1;
+	struct folio_batch fbatch;
+	pgoff_t indices[PAGEVEC_SIZE];
 
-	ret = shmem_undo_range(inode, 0, -1, false, &shmem_luo_undo_ops, fdt);
-	if (ret) {
-		pr_err("shmem: failed to undo range: %d\n", ret);
-		goto err;
-	}
-	return 0;
+	folio_batch_init(&fbatch);
 
-err:
-	/*
-	 * TODO: This kills the whole file on failure to KHO. We should keep the
-	 * contents around for another try later. The problem is, if re-adding
-	 * pages fails, there would be no recovery at that point. Ideally, we
-	 * should first serialize the whole file, and only then remove things
-	 * from page cache so we are sure to never fail.
-	 */
-	folios = fdt_getprop(fdt, 0, "folios", &len);
-	if (folios) {
-		int i;
+	while(start < end) {
+		int count;
 
-		for (i = 0; i < len / sizeof(*folios); i++) {
-			phys_addr_t phys = folios[i][0];
-			struct folio *folio = page_folio(phys_to_page(phys));
+		count = find_get_entries(inode->i_mapping, &start, end - 1, &fbatch, indices);
+		if (count == 0)
+			break;
 
-			folio_put(folio);
+		for (int i = 0; i < count; i ++) {
+			struct folio* f = fbatch.folios[i];
+
+			if (xa_is_value(f)) {
+				pr_err("TODO: handle swap");
+				err = -ENOTSUPP;
+				break;
+			}
+
+			err = shmem_luo_preserve_folio(fdt, f);
+			if (err)
+				break;
+
+			pr_err("preserved");
 		}
+		folio_batch_remove_exceptionals(&fbatch);
+		folio_batch_release(&fbatch);
+		if (err)
+			break;
 	}
 
-	/* Undo the rest of the file. This should not fail. */
-	WARN_ON(shmem_undo_range(inode, 0, -1, false, &shmem_default_undo_ops, NULL));
-	return ret;
+	if (err)
+		shmem_luo_unpreserve_folios(fdt);
+
+	return err;
 }
 
 static int shmem_luo_prepare(struct file *file, void *arg, u64 *data) {
@@ -5423,36 +5438,42 @@ free:
 }
 
 static void shmem_luo_cancel(struct file *file, void *arg, u64 data) {
+	void *fdt = phys_to_virt(data);
+	struct folio *fdt_folio = virt_to_folio(fdt);
+
+	shmem_luo_unpreserve_folios(fdt);
+	kho_unpreserve_folio(fdt_folio);
+	folio_put(fdt_folio);
+	pr_err("unpreserved fdt_folio = %llx\n", data);
 
 }
 
 static void shmem_luo_finish(struct file *file, void *arg, u64 data, bool reclaimed) {
-	pr_err("shmem_luo_finish done\n");
-	return;
-// 	const void *fdt = phys_to_virt((phys_addr_t)data);
-// 	const u64 (*folios)[2];
-// 	int len;
-// 	int i;
+	phys_addr_t fdt_phys = data;
+	void *fdt = phys_to_virt(fdt_phys);
+	struct folio *fdt_folio;
 
-// 	if (reclaimed)
-// 		goto put_fdt;
+	if (!reclaimed)	{
+		const u64 (*folios)[2];
+		int len;
+		int i;
 
-// 	folios = fdt_getprop(fdt, 0, "folios", &len);
-// 	if (!folios || len % sizeof(*folios)) {
-// 		pr_err("invalid 'folios' property\n");
-// 		goto put_fdt;
-// 	}
+		folios = fdt_getprop(fdt, 0, "folios", &len);
+		if (!folios)
+			return;
 
-// 	for (i = 0; i < len_folios / sizeof(*folios); i++) {
-// 		folio = kho_restore_folio(folios[i][0]);
-// 		if (folio)
-// 			folio_put(folio);
-// 		else
-// 			pr_err("invalid folio address: %llx\n", folios[i][0]);
-// 	}
+		for (i = 0; i < len / sizeof(*folios); i++) {
+			phys_addr_t phys = folios[i][0];
+			struct folio *f = kho_restore_folio(phys);
 
-// put_fdt:
-// 	folio_put(virt_to_folio(fdt));
+			folio_put(f);
+			pr_err("shmem_luo_finish, not relcaimed: %llx, phys=%llx\n", data, phys );
+		}
+	}
+
+	fdt_folio = kho_restore_folio(fdt_phys);
+	folio_put(fdt_folio);
+	pr_err("shmem_luo_finish, put fdt: %llx\n", fdt_phys);
 }
 
 static int shmem_luo_retrieve(void *arg, u64 data, struct file **file_p) {
