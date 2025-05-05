@@ -101,7 +101,7 @@ struct liveupdate_filesystem {
 	void (*cancel)(struct file *file, void *arg, u64 data);
 	void (*finish)(struct file *file, void *arg, u64 data, bool reclaimed);
 	int (*retrieve)(void *arg, u64 data, struct file **file);
-	char *compatible;
+	const char *compatible;
 	bool (*can_preserve)(struct file *file, void *arg);
 	void *arg;
 	struct list_head list;
