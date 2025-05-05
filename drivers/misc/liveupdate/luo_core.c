@@ -106,7 +106,7 @@ static inline void luo_set_state(enum liveupdate_state state)
 }
 
 /* Called during the prepare phase, to create LUO fdt tree */
-static int luo_fdt_setup(struct kho_serialization *ser)
+static int luo_fdt_setup(void)
 {
 	u8 state_val;
 	int ret;
@@ -141,10 +141,6 @@ static int luo_fdt_setup(struct kho_serialization *ser)
 		goto exit_free;
 
 	ret = kho_preserve_phys(__pa(luo_fdt_out), LUO_FDT_SIZE);
-	if (ret)
-		goto exit_free;
-
-	ret = kho_add_subtree(ser, LUO_KHO_ENTRY_NAME, luo_fdt_out);
 	if (ret)
 		goto exit_free;
 
@@ -206,36 +202,32 @@ static void luo_do_cancel_calls(void)
 	luo_do_subsystems_cancel_calls();
 }
 
-static int __luo_prepare(struct kho_serialization *ser)
+static int __luo_reboot(struct kho_serialization *ser)
 {
 	int ret;
 
 	if (down_write_killable(&luo_state_rwsem)) {
-		pr_warn("[prepare] event canceled by user\n");
+		pr_warn("[reboot] event canceled by user\n");
 		return -EAGAIN;
 	}
 
-	if (!IS_STATE(LIVEUPDATE_STATE_NORMAL)) {
+	if (!IS_STATE(LIVEUPDATE_STATE_PREPARED)) {
 		pr_warn("Can't switch to [%s] from [%s] state\n",
-			luo_state_str[LIVEUPDATE_STATE_PREPARED],
+			luo_state_str[LIVEUPDATE_STATE_FROZEN],
 			LUO_STATE_STR);
-		ret = -EINVAL;
-		goto exit_unlock;
+		up_write(&luo_state_rwsem);
+
+		return -EINVAL;
 	}
 
-	ret = luo_fdt_setup(ser);
-	if (ret)
-		goto exit_unlock;
+	ret = luo_do_reboot_calls();
+	if (!ret)
+		luo_set_state(LIVEUPDATE_STATE_FROZEN);
+	else
+		luo_set_state(LIVEUPDATE_STATE_NORMAL);
 
-	luo_kho_ser = ser;
-	ret = luo_do_prepare_calls();
-	luo_kho_ser = NULL;
-	if (ret)
-		goto exit_unlock;
+	ret = kho_add_subtree(ser, LUO_KHO_ENTRY_NAME, luo_fdt_out);
 
-	luo_set_state(LIVEUPDATE_STATE_PREPARED);
-
-exit_unlock:
 	up_write(&luo_state_rwsem);
 
 	return ret;
@@ -266,14 +258,14 @@ static int __luo_cancel(struct kho_serialization *ser)
 	return 0;
 }
 
-static int luo_kho_prepare_notifier(struct notifier_block *self,
+static int luo_kho_reboot_notifier(struct notifier_block *self,
 				    unsigned long cmd, void *v)
 {
 	int ret;
 
 	switch (cmd) {
 	case KEXEC_KHO_FINALIZE:
-		ret = __luo_prepare((struct kho_serialization *)v);
+		ret = __luo_reboot((struct kho_serialization *)v);
 		break;
 	case KEXEC_KHO_ABORT:
 		ret = __luo_cancel((struct kho_serialization *)v);
@@ -285,8 +277,8 @@ static int luo_kho_prepare_notifier(struct notifier_block *self,
 	return notifier_from_errno(ret);
 }
 
-static struct notifier_block luo_kho_prepare_notifier_nb = {
-	.notifier_call = luo_kho_prepare_notifier,
+static struct notifier_block luo_kho_reboot_notifier_nb = {
+	.notifier_call = luo_kho_reboot_notifier,
 };
 
 /**
@@ -305,7 +297,35 @@ static struct notifier_block luo_kho_prepare_notifier_nb = {
  */
 int luo_prepare(void)
 {
-	return kho_finalize();
+	int ret;
+
+	if (down_write_killable(&luo_state_rwsem)) {
+		pr_warn("[prepare] event canceled by user\n");
+		return -EAGAIN;
+	}
+
+	if (!IS_STATE(LIVEUPDATE_STATE_NORMAL)) {
+		pr_warn("Can't switch to [%s] from [%s] state\n",
+			luo_state_str[LIVEUPDATE_STATE_PREPARED],
+			LUO_STATE_STR);
+		ret = -EINVAL;
+		goto exit_unlock;
+	}
+
+	ret = luo_fdt_setup();
+	if (ret)
+		goto exit_unlock;
+
+	ret = luo_do_prepare_calls();
+	if (ret)
+		goto exit_unlock;
+
+	luo_set_state(LIVEUPDATE_STATE_PREPARED);
+
+exit_unlock:
+	up_write(&luo_state_rwsem);
+
+	return ret;
 }
 
 /**
@@ -330,31 +350,7 @@ int luo_prepare(void)
  */
 int luo_reboot(void)
 {
-	int ret;
-
-	if (down_write_killable(&luo_state_rwsem)) {
-		pr_warn("[reboot] event canceled by user\n");
-		return -EAGAIN;
-	}
-
-	if (!IS_STATE(LIVEUPDATE_STATE_PREPARED)) {
-		pr_warn("Can't switch to [%s] from [%s] state\n",
-			luo_state_str[LIVEUPDATE_STATE_FROZEN],
-			LUO_STATE_STR);
-		up_write(&luo_state_rwsem);
-
-		return -EINVAL;
-	}
-
-	ret = luo_do_reboot_calls();
-	if (!ret)
-		luo_set_state(LIVEUPDATE_STATE_FROZEN);
-	else
-		luo_set_state(LIVEUPDATE_STATE_NORMAL);
-
-	up_write(&luo_state_rwsem);
-
-	return ret;
+	return kho_finalize();
 }
 
 /**
@@ -436,7 +432,7 @@ static int __init luo_startup(void)
 		return 0;
 	}
 
-	ret = register_kho_notifier(&luo_kho_prepare_notifier_nb);
+	ret = register_kho_notifier(&luo_kho_reboot_notifier_nb);
 	if (ret) {
 		luo_enabled = false;
 		pr_warn("Faile to register with KHO [%d]\n", ret);
