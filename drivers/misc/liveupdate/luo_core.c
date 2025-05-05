@@ -64,7 +64,6 @@ const char *const luo_state_str[] = {
 
 bool luo_enabled;
 
-static struct kho_serialization *luo_kho_ser;
 static void *luo_fdt_out;
 static void *luo_fdt_in;
 /* LUO FDT size is 2M, if needed can be expanded */
