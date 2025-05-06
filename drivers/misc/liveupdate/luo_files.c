@@ -161,6 +161,7 @@ static int luo_files_recreate_luo_files_xa_in(void)
 		if (ret < 0) {
 			pr_err("Skipping FDT node '%s': Failed to parse token\n",
 			       node_name);
+			ret = 0;
 			continue;
 		}
 
@@ -215,7 +216,7 @@ static int luo_files_recreate_luo_files_xa_in(void)
 		fs->refcnt++;
 	}
 
-	if (ret)
+	if (!ret)
 		luo_files_xa_in_recreated = true;
 
 	return ret;
