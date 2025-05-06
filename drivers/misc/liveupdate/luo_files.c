@@ -143,12 +143,6 @@ static int luo_files_recreate_luo_files_xa_in(void)
 	if (luo_files_xa_in_recreated)
 		return 0;
 
-	if (down_write_killable(&luo_state_rwsem))
-		return -EINTR;
-
-	if (luo_files_xa_in_recreated)
-		goto exit_unlock;
-
 	parent_node_offset = fdt_subnode_offset(luo_fdt_in, 0,
 						LUO_FILES_NODE_NAME);
 
@@ -224,8 +218,6 @@ static int luo_files_recreate_luo_files_xa_in(void)
 	if (ret)
 		luo_files_xa_in_recreated = true;
 
-exit_unlock:
-	up_write(&luo_state_rwsem);
 	return ret;
 }
 
@@ -610,11 +602,11 @@ int luo_retrieve_file(u64 token, struct file **file)
 	struct luo_file *luo_file;
 	int ret = 0;
 
+	down_read(&luo_state_rwsem);
+
 	ret = luo_files_recreate_luo_files_xa_in();
 	if (ret)
-		return ret;
-
-	down_read(&luo_state_rwsem);
+		goto unlock;
 
 	if (!liveupdate_state_updated()) {
 		pr_warn("File can be retrieved only in updated state\n");
@@ -638,6 +630,7 @@ int luo_retrieve_file(u64 token, struct file **file)
 		ret = -ENOENT;
 	}
 
+unlock:
 	up_read(&luo_state_rwsem);
 
 	return ret;
