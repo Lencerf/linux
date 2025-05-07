@@ -8,14 +8,14 @@ Kexec HandOver (KHO) is a mechanism that allows Linux to preserve memory
 regions, which could contain serialized system states, across kexec.
 
 This document expects that you are familiar with the base KHO
-:ref:`concepts <concepts>`. If you have not read
+:ref:`concepts <kho-concepts>`. If you have not read
 them yet, please do so now.
 
 Prerequisites
 =============
 
-KHO is available when the ``CONFIG_KEXEC_HANDOVER`` config option is set to y
-at compile time. Every KHO producer may have its own config option that you
+KHO is available when the kernel is compiled with ``CONFIG_KEXEC_HANDOVER``
+set to y. Every KHO producer may have its own config option that you
 need to enable if you would like to preserve their respective state across
 kexec.
 
@@ -29,7 +29,7 @@ Perform a KHO kexec
 ===================
 
 First, before you perform a KHO kexec, you need to move the system into
-the :ref:`KHO finalization phase <finalization_phase>` ::
+the :ref:`KHO finalization phase <kho-finalization-phase>` ::
 
   $ echo 1 > /sys/kernel/debug/kho/out/finalize
 
@@ -43,7 +43,7 @@ use the ``-s`` parameter to use the in-kernel kexec file loader, as user
 space kexec tooling currently has no support for KHO with the user space
 based file loader ::
 
-  # kexec -l Image --initrd=initrd -s
+  # kexec -l /path/to/bzImage --initrd /path/to/initrd -s
   # kexec -e
 
 The new kernel will boot up and contain some of the previous kernel's state.
@@ -89,20 +89,15 @@ stabilized.
     as input file for the KHO payload image.
 
 ``/sys/kernel/debug/kho/out/scratch_len``
-    To support continuous KHO kexecs, we need to reserve
-    physically contiguous memory regions that will always stay
-    available for future kexec allocations. This file describes
-    the length of these memory regions. Kexec user space tooling
-    can use this to determine where it should place its payload
-    images.
+    Lengths of KHO scratch regions, which are physically contiguous
+    memory regions that will always stay available for future kexec
+    allocations. Kexec user space tools can use this file to determine
+    where it should place its payload images.
 
 ``/sys/kernel/debug/kho/out/scratch_phys``
-    To support continuous KHO kexecs, we need to reserve
-    physically contiguous memory regions that will always stay
-    available for future kexec allocations. This file describes
-    the physical location of these memory regions. Kexec user space
-    tooling can use this to determine where it should place its
-    payload images.
+    Physical locations of KHO scratch regions. Kexec user space tools
+    can use this file in conjunction to scratch_phys to determine where
+    it should place its payload images.
 
 ``/sys/kernel/debug/kho/out/sub_fdts/``
     In the KHO finalization phase, KHO producers register their own

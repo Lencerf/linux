@@ -32,7 +32,7 @@ KHO process will be bypassed.
 Property ``fdt``
 ----------------
 
-Generally, A KHO user serialize its state into its own FDT and instructs
+Generally, a KHO user serialize its state into its own FDT and instructs
 KHO to preserve the underlying memory, such that after kexec, the new kernel
 can recover its state from the preserved FDT.
 
