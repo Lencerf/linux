@@ -6,6 +6,10 @@
  * Copyright (C) 2025 Google LLC, Changyuan Lyu <changyuanl@google.com>
  */
 
+#include "linux/gfp.h"
+#include "linux/page-flags.h"
+#include "linux/page_ref.h"
+#include "linux/printk.h"
 #define pr_fmt(fmt) "KHO: " fmt
 
 #include <linux/cma.h>
@@ -1019,7 +1023,7 @@ static __init int kho_init(void)
 	if (!kho_enable)
 		return 0;
 
-	kho_out.ser.fdt = alloc_page(GFP_KERNEL);
+	kho_out.ser.fdt = folio_page(folio_alloc(GFP_KERNEL, 1), 0);
 	if (!kho_out.ser.fdt) {
 		err = -ENOMEM;
 		goto err_free_scratch;
@@ -1112,6 +1116,8 @@ void __init kho_memory_init(void)
 		folio = kho_restore_folio(kho_in.fdt_phys);
 		if (!folio)
 			pr_warn("failed to restore folio for KHO fdt\n");
+		else
+		 	pr_err("fdt folio ref = %d\n", folio_ref_count(folio));
 	} else {
 		kho_reserve_scratch();
 	}
