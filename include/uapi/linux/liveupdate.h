@@ -46,6 +46,7 @@ enum liveupdate_state  {
 	LIVEUPDATE_STATE_UPDATED = 3,
 };
 
+#define LUO_FILE_TOKEN_INVALID 0ULL
 /**
  * struct liveupdate_fd - Holds parameters for preserving and restoring file
  * descriptors across live update.

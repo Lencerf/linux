@@ -41,6 +41,7 @@
 #include <linux/swapfile.h>
 #include <linux/iversion.h>
 #include <linux/unicode.h>
+#include <linux/liveupdate.h>
 #include "swap.h"
 
 static struct vfsmount *shm_mnt __ro_after_init;
@@ -2943,6 +2944,25 @@ static int shmem_file_open(struct inode *inode, struct file *file)
 	return generic_file_open(inode, file);
 }
 
+static int shmem_file_release(struct inode *inode, struct file *file)
+{
+	struct shmem_file_info *info = file->private_data;
+
+	file->private_data = NULL;
+	if (info && info->luo_token != LUO_FILE_TOKEN_INVALID) {
+		int err = 0;
+		if (liveupdate_state_normal() || liveupdate_state_updated())
+			err = luo_unregister_file(info->luo_token);
+		if (err)
+			pr_err("Failed to unregister shmem fd from LUO: %d\n", err);
+		pr_err("unregisterred token %llx\n", info->luo_token);
+		kfree(info);
+	} else {
+		pr_err("memfd: info=%llx, file=%llx\n", (u64)info, (u64)file);
+	}
+	return 0;
+}
+
 #ifdef CONFIG_TMPFS_XATTR
 static int shmem_initxattrs(struct inode *, const struct xattr *, void *);
 
@@ -5206,6 +5226,7 @@ static const struct address_space_operations shmem_aops = {
 static const struct file_operations shmem_file_operations = {
 	.mmap		= shmem_mmap,
 	.open		= shmem_file_open,
+	.release 	= shmem_file_release,
 	.get_unmapped_area = shmem_get_unmapped_area,
 #ifdef CONFIG_TMPFS
 	.llseek		= shmem_file_llseek,

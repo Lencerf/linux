@@ -6,6 +6,15 @@
  * Changyuan Lyu <changyuanl@google.com>
  */
 
+ #define pr_fmt(fmt) "MEMFD_LUO: " fmt
+
+
+// #include "linux/errno.h"
+// #include "linux/gfp_types.h"
+// #include "linux/printk.h"
+// #include "linux/slab.h"
+// #include "linux/stddef.h"
+#include "linux/printk.h"
 #include <linux/file.h>
 #include <linux/io.h>
 #include <linux/libfdt.h>
@@ -305,10 +314,25 @@ free:
 	return ret;
 }
 
-static bool memfd_luo_can_preserve(struct file *file, void *arg) {
+static int memfd_luo_register(struct file *file, void *arg, u64 token) {
 	struct inode *inode = file_inode(file);
+	struct shmem_file_info *info = file->private_data;
 
-	return shmem_file(file) && !inode->i_nlink;
+	if (!shmem_file(file) || inode->i_nlink)
+		return -ENOTSUPP;
+
+	if (!info) {
+		pr_err("memfd: info is empty\n");
+		info = kmalloc(sizeof(*info),GFP_KERNEL);
+		if (!info)
+			return -ENOMEM;
+		file->private_data = info;
+	}
+
+	info->luo_token = token;
+	pr_err("memfd: token=%llx, info=%llx, file=%llx\n", token, (u64)info, (u64)file);
+
+	return 0;
 }
 
 
@@ -318,7 +342,7 @@ static struct liveupdate_filesystem memfd_luo_fs_ops = {
 	.finish = memfd_luo_finish,
 	.retrieve = memfd_luo_retrieve,
 	.compatible = memfd_luo_compatible,
-	.can_preserve = memfd_luo_can_preserve,
+	.register_ = memfd_luo_register,
 };
 
 static int __init memfd_luo_init(void)

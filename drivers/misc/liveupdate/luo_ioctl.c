@@ -33,15 +33,15 @@ static int luo_ioctl_fd_preserve(struct liveupdate_fd *luo_fd)
 	struct file *file;
 	int ret;
 
-	file = fget(luo_fd->fd);
+	file = fget_raw(luo_fd->fd);
 	if (!file) {
 		pr_err("Bad file descriptor\n");
 		return -EBADF;
 	}
 
 	ret = luo_register_file(&luo_fd->token, file);
-	if (ret)
-		fput(file);
+	// if (ret)
+	fput(file);
 
 	return ret;
 }

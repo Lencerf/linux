@@ -80,9 +80,11 @@ struct file;
  *                 handler supports. This is matched against the compatible
  *                 string associated with individual &struct liveupdate_file
  *                 instances.
- * @can_preserve:  callback to determine if @file with associated context (@arg)
- *                 can be preserved by this handler.
- *                 Return bool (true if preservable, false otherwise).
+ * @register_:     prepare to register @file with @token.
+ *                 Return 0 if the
+ *                 @file can be preserved by this handler and the handler has
+ *                 associated @file with @token. Return errno if this handler
+ *                 cannot handle this @file.
  * @arg:           An opaque pointer to implementation-specific context data
  *                 associated with this filesystem handler registration.
  * @list:          used for linking this handler instance into a global list of
@@ -100,10 +102,13 @@ struct liveupdate_filesystem {
 	void (*finish)(struct file *file, void *arg, u64 data, bool reclaimed);
 	int (*retrieve)(void *arg, u64 data, struct file **file);
 	const char *compatible;
-	bool (*can_preserve)(struct file *file, void *arg);
+	int (*register_)(struct file *file, void *arg, u64 token);
+	// bool (*can_preserve)(struct file *file, void *arg);
 	void *arg;
 	struct list_head list;
 };
+
+int luo_unregister_file(u64 token);
 
 /**
  * struct liveupdate_subsystem - Represents a subsystem participating in LUO

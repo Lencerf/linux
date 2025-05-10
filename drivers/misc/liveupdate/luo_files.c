@@ -44,6 +44,8 @@
  * u64 data, to recreate or find the appropriate &struct file object.
  */
 
+#include "linux/errno.h"
+#include "linux/printk.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/err.h>
@@ -70,7 +72,14 @@ static LIST_HEAD(luo_filesystems_list);
 static void *luo_fdt_out;
 static void *luo_fdt_in;
 
-static u64 luo_next_file_token;
+static u64 get_next_file_token(void) {
+	static u64 luo_next_file_token;
+
+	luo_next_file_token++;
+	if (luo_next_file_token == LUO_FILE_TOKEN_INVALID)
+		luo_next_file_token++;
+	return luo_next_file_token;
+}
 
 /**
  * struct luo_file - Represents a file descriptor instance preserved
@@ -477,16 +486,24 @@ int luo_register_file(u64 *tokenp, struct file *file)
 	}
 
 	down_read(&luo_filesystems_list_rwsem);
+	token = get_next_file_token();
+
 	list_for_each_entry(fs, &luo_filesystems_list, list) {
-		if (fs->can_preserve(file, fs->arg)) {
+		pr_err("trying %s\n", fs->compatible);
+		int err = fs->register_(file, fs->arg, token);
+
+		if (!err) {
 			found = true;
 			break;
 		}
+
+		if (err != -ENOTSUPP)
+			pr_err("register with %s: %d\n", fs->compatible, err);
+		else
+			pr_err("%s does not support\n", fs->compatible);
 	}
 
 	if (found) {
-		token = luo_next_file_token;
-		luo_next_file_token++;
 
 		luo_file->private_data = 0;
 		luo_file->reclaimed = false;
