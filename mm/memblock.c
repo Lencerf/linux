@@ -1566,6 +1566,10 @@ again:
 		goto again;
 	}
 
+	if (flags & MEMBLOCK_KHO_SCRATCH) {
+		pr_err_once("Could not allocate %pap bytes in KHO scratch\n", &size);
+	}
+
 	return 0;
 
 done:
