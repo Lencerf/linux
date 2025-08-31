@@ -229,7 +229,7 @@ int vp_modern_probe(struct virtio_pci_modern_device *mdev)
 	int devid;
 
 	check_offsets();
-
+	pr_err("vp_modern_probe: %s\n", pci_name(pci_dev));
 	if (mdev->device_id_check) {
 		devid = mdev->device_id_check(pci_dev);
 		if (devid < 0)

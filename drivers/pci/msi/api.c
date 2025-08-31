@@ -256,6 +256,7 @@ int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
 	struct irq_affinity msi_default_affd = {0};
 	int nvecs = -ENOSPC;
 
+	pr_err("pci_alloc_irq_vectors_affinity: PCI_IRQ_AFFINITY=%d", flags & PCI_IRQ_AFFINITY);
 	if (flags & PCI_IRQ_AFFINITY) {
 		if (!affd)
 			affd = &msi_default_affd;
@@ -267,6 +268,8 @@ int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs,
 	if (flags & PCI_IRQ_MSIX) {
 		nvecs = __pci_enable_msix_range(dev, NULL, min_vecs, max_vecs,
 						affd, flags);
+		pr_err("__pci_enable_msix_range(dev=%p, min_vecs=%d, max_vecs=%d, affd=%p, flags=%d) -> %d",
+		       	dev, min_vecs, max_vecs, affd, flags, nvecs);
 		if (nvecs > 0)
 			return nvecs;
 	}

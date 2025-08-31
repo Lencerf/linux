@@ -15,6 +15,7 @@
  */
 
 #include "virtio_pci_common.h"
+#include "linux/printk.h"
 
 static bool force_legacy = false;
 
@@ -159,8 +160,10 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 
 	err = pci_alloc_irq_vectors_affinity(vp_dev->pci_dev, nvectors,
 					     nvectors, flags, desc);
-	if (err < 0)
+	if (err < 0) {
+		pr_err("pci_alloc_irq_vectors_affinity failed %d", err);
 		goto error;
+	}
 	vp_dev->msix_enabled = 1;
 
 	/* Set the vector used for configuration */
@@ -170,8 +173,10 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 	err = request_irq(pci_irq_vector(vp_dev->pci_dev, v),
 			  vp_config_changed, 0, vp_dev->msix_names[v],
 			  vp_dev);
-	if (err)
+	if (err) {
+		pr_err("request_irq failed %d", err);
 		goto error;
+	}
 	++vp_dev->msix_used_vectors;
 
 	v = vp_dev->config_vector(vp_dev, v);
@@ -189,8 +194,10 @@ static int vp_request_msix_vectors(struct virtio_device *vdev, int nvectors,
 		err = request_irq(pci_irq_vector(vp_dev->pci_dev, v),
 				  vp_vring_interrupt, 0, vp_dev->msix_names[v],
 				  vp_dev);
-		if (err)
+		if (err) {
+			pr_err("request_irq failed %d", err);
 			goto error;
+		}
 		++vp_dev->msix_used_vectors;
 	}
 	return 0;
@@ -393,8 +400,10 @@ static int vp_find_vqs_msix(struct virtio_device *vdev, unsigned int nvqs,
 
 	if (vp_dev->avq_index) {
 		err = vp_dev->avq_index(vdev, &avq->vq_index, &avq_num);
-		if (err)
+		if (err) {
+			pr_err("vp_dev->avq_index failed %d", err);
 			goto error_find;
+		}
 	}
 
 	per_vq_vectors = vector_policy != VP_VQ_VECTOR_POLICY_SHARED;
@@ -415,9 +424,10 @@ static int vp_find_vqs_msix(struct virtio_device *vdev, unsigned int nvqs,
 	}
 
 	err = vp_request_msix_vectors(vdev, nvectors, per_vq_vectors, desc);
-	if (err)
+	if (err) {
+		pr_err("vp_request_msix_vectors failed %d", err);
 		goto error_find;
-
+	}
 	vp_dev->per_vq_vectors = per_vq_vectors;
 	allocated_vectors = vp_dev->msix_used_vectors;
 	for (i = 0; i < nvqs; ++i) {
@@ -432,6 +442,7 @@ static int vp_find_vqs_msix(struct virtio_device *vdev, unsigned int nvqs,
 					     &vp_dev->vqs[i]);
 		if (IS_ERR(vqs[i])) {
 			err = PTR_ERR(vqs[i]);
+			pr_err("vp_find_one_vq_msix failed %d", err);
 			goto error_find;
 		}
 	}
@@ -444,6 +455,7 @@ static int vp_find_vqs_msix(struct virtio_device *vdev, unsigned int nvqs,
 				 vector_policy, &vp_dev->admin_vq.info);
 	if (IS_ERR(vq)) {
 		err = PTR_ERR(vq);
+		pr_err("vp_find_one_vq_msix failed %d", err);
 		goto error_find;
 	}
 
@@ -524,23 +536,35 @@ int vp_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
 	/* Try MSI-X with one vector per queue. */
 	err = vp_find_vqs_msix(vdev, nvqs, vqs, vqs_info,
 			       VP_VQ_VECTOR_POLICY_EACH, desc);
-	if (!err)
+	if (!err) {
+		pr_err("vp_find_vqs_msix successfully initialized: VP_VQ_VECTOR_POLICY_EACH");
 		return 0;
+	}
+
+	pr_err("vp_find_vqs_msix failed %d", err);
 	/* Fallback: MSI-X with one shared vector for config and
 	 * slow path queues, one vector per queue for the rest.
 	 */
 	err = vp_find_vqs_msix(vdev, nvqs, vqs, vqs_info,
 			       VP_VQ_VECTOR_POLICY_SHARED_SLOW, desc);
-	if (!err)
+	if (!err) {
+		pr_err("vp_find_vqs_msix successfully initialized: VP_VQ_VECTOR_POLICY_SHARED_SLOW");
 		return 0;
+	}
+	pr_err("vp_find_vqs_msix failed %d", err);
 	/* Fallback: MSI-X with one vector for config, one shared for queues. */
 	err = vp_find_vqs_msix(vdev, nvqs, vqs, vqs_info,
 			       VP_VQ_VECTOR_POLICY_SHARED, desc);
-	if (!err)
+	if (!err) {
+		pr_err("vp_find_vqs_msix successfully initialized: VP_VQ_VECTOR_POLICY_SHARED");
 		return 0;
+	}
+	pr_err("vp_find_vqs_msix failed %d", err);
 	/* Is there an interrupt? If not give up. */
-	if (!(to_vp_device(vdev)->pci_dev->irq))
+	if (!(to_vp_device(vdev)->pci_dev->irq)) {
+		pr_err("No interrupt found %d", to_vp_device(vdev)->pci_dev->irq);
 		return err;
+	}
 	/* Finally fall back to regular interrupts. */
 	return vp_find_vqs_intx(vdev, nvqs, vqs, vqs_info);
 }
@@ -685,6 +709,7 @@ static int virtio_pci_probe(struct pci_dev *pci_dev,
 	struct virtio_pci_device *vp_dev, *reg_dev = NULL;
 	int rc;
 
+	pr_err("virtio_pci_probe: %s\n", pci_name(pci_dev));
 	/* allocate our structure and fill it out */
 	vp_dev = kzalloc(sizeof(struct virtio_pci_device), GFP_KERNEL);
 	if (!vp_dev)

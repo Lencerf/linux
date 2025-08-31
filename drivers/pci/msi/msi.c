@@ -805,8 +805,11 @@ int __pci_enable_msix_range(struct pci_dev *dev, struct msix_entry *entries, int
 		return -EINVAL;
 
 	/* Check MSI-X early on irq domain enabled architectures */
-	if (!pci_msi_domain_supports(dev, MSI_FLAG_PCI_MSIX, ALLOW_LEGACY))
+	if (!pci_msi_domain_supports(dev, MSI_FLAG_PCI_MSIX, ALLOW_LEGACY)) {
+		pr_err("pci_msi_domain_supports(dev=%p, MSI_FLAG_PCI_MSIX, ALLOW_LEGACY)",
+		       	dev);
 		return -ENOTSUPP;
+	}
 
 	if (!pci_msi_supported(dev, nvec) || dev->current_state != PCI_D0)
 		return -EINVAL;

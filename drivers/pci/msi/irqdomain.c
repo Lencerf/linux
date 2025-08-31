@@ -350,6 +350,11 @@ bool pci_msi_domain_supports(struct pci_dev *pdev, unsigned int feature_mask,
 	unsigned int supported;
 
 	domain = dev_get_msi_domain(&pdev->dev);
+	pr_err("dev_get_msi_domain: %s, domain is null %d", pdev->dev.init_name, domain == NULL);
+	if (domain) {
+		pr_err("irq_domain_is_hierarchy: %d", irq_domain_is_hierarchy(domain));
+		pr_err("irq_domain_is_msi_parent: %d", irq_domain_is_msi_parent(domain));
+	}
 
 	if (!domain || !irq_domain_is_hierarchy(domain)) {
 		if (IS_ENABLED(CONFIG_PCI_MSI_ARCH_FALLBACKS))

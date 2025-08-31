@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include "linux/printk.h"
 #include <linux/virtio.h>
 #include <linux/spinlock.h>
 #include <linux/virtio_config.h>
@@ -276,6 +277,8 @@ static int virtio_dev_probe(struct device *_d)
 	u64 driver_features;
 	u64 driver_features_legacy;
 
+	// dump_stack();
+	pr_err("virtio_dev_probe: dev_name=%d, drv_name=%s\n", dev->id.device, drv->driver.name);
 	/* We have a driver! */
 	virtio_add_status(dev, VIRTIO_CONFIG_S_DRIVER);
 
@@ -316,31 +319,41 @@ static int virtio_dev_probe(struct device *_d)
 			__virtio_set_bit(dev, i);
 
 	err = dev->config->finalize_features(dev);
-	if (err)
+	if (err) {
+		pr_err("finalize_features failed: %d", err);
 		goto err;
+	}
 
 	if (drv->validate) {
 		u64 features = dev->features;
 
 		err = drv->validate(dev);
-		if (err)
+		if (err) {
+			pr_err("validate failed: %d", err);
 			goto err;
+		}
 
 		/* Did validation change any features? Then write them again. */
 		if (features != dev->features) {
 			err = dev->config->finalize_features(dev);
-			if (err)
+			if (err) {
+				pr_err("finalize_features2 failed: %d", err);
 				goto err;
+			}
 		}
 	}
 
 	err = virtio_features_ok(dev);
-	if (err)
+	if (err) {
+		pr_err("virtio_features_ok failed: %d", err);
 		goto err;
+	}
 
 	err = drv->probe(dev);
-	if (err)
+	if (err) {
+		pr_err("drv->probe failed: %d", err);
 		goto err;
+	}
 
 	/* If probe didn't do it, mark device DRIVER_OK ourselves. */
 	if (!(dev->config->get_status(dev) & VIRTIO_CONFIG_S_DRIVER_OK))

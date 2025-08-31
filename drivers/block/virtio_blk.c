@@ -1015,8 +1015,10 @@ static int init_vq(struct virtio_blk *vblk)
 
 	/* Discover virtqueues and write information to configuration.  */
 	err = virtio_find_vqs(vdev, num_vqs, vqs, vqs_info, &desc);
-	if (err)
+	if (err) {
+		pr_err("virtio_find_vqs failed: %d", err);
 		goto out;
+	}
 
 	for (i = 0; i < num_vqs; i++) {
 		spin_lock_init(&vblk->vqs[i].lock);
@@ -1463,8 +1465,10 @@ static int virtblk_probe(struct virtio_device *vdev)
 	INIT_WORK(&vblk->config_work, virtblk_config_changed_work);
 
 	err = init_vq(vblk);
-	if (err)
+	if (err) {
+		pr_err("init_vq failed: %d", err);
 		goto out_free_vblk;
+	}
 
 	/* Default queue sizing is to fill the ring. */
 	if (!virtblk_queue_depth) {
@@ -1490,12 +1494,16 @@ static int virtblk_probe(struct virtio_device *vdev)
 		vblk->tag_set.nr_maps = 3;
 
 	err = blk_mq_alloc_tag_set(&vblk->tag_set);
-	if (err)
+	if (err) {
+		pr_err("blk_mq_alloc_tag_set failed: %d", err);
 		goto out_free_vq;
+	}
 
 	err = virtblk_read_limits(vblk, &lim);
-	if (err)
+	if (err) {
+		pr_err("virtblk_read_limits failed: %d", err);
 		goto out_free_tags;
+	}
 
 	if (virtblk_get_cache_mode(vdev))
 		lim.features |= BLK_FEAT_WRITE_CACHE;
@@ -1534,8 +1542,10 @@ static int virtblk_probe(struct virtio_device *vdev)
 	}
 
 	err = device_add_disk(&vdev->dev, vblk->disk, virtblk_attr_groups);
-	if (err)
+	if (err) {
+		pr_err("device_add_disk failed: %d", err);
 		goto out_cleanup_disk;
+	}
 
 	return 0;
 

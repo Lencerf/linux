@@ -1324,7 +1324,7 @@ int of_phandle_iterator_next(struct of_phandle_iterator *it)
 		 */
 		if (it->cur + count > it->list_end) {
 			if (it->cells_name)
-				pr_err("%pOF: %s = %d found %td\n",
+				pr_err("clyu: %pOF: %s = %d found %td\n",
 					it->parent, it->cells_name,
 					count, it->list_end - it->cur);
 			else

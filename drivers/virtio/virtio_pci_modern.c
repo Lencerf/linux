@@ -750,8 +750,10 @@ static int vp_modern_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
 	struct virtqueue *vq;
 	int rc = vp_find_vqs(vdev, nvqs, vqs, vqs_info, desc);
 
-	if (rc)
+	if (rc) {
+		pr_err("vp_find_vqs failed: %d", rc);
 		return rc;
+	}
 
 	/* Select and activate all queues. Has to be done last: once we do
 	 * this, there's no way to go back except reset.
@@ -1270,6 +1272,8 @@ int virtio_pci_modern_probe(struct virtio_pci_device *vp_dev)
 	struct virtio_pci_modern_device *mdev = &vp_dev->mdev;
 	struct pci_dev *pci_dev = vp_dev->pci_dev;
 	int err;
+
+	pr_err("virtio_pci_modern_probe: %s\n", pci_name(pci_dev));
 
 	mdev->pci_dev = pci_dev;
 

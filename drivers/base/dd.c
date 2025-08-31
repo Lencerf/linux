@@ -16,6 +16,7 @@
  * Copyright (c) 2007-2009 Novell Inc.
  */
 
+#include "linux/printk.h"
 #include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/delay.h>
@@ -573,10 +574,13 @@ static int call_driver_probe(struct device *dev, const struct device_driver *drv
 {
 	int ret = 0;
 
-	if (dev->bus->probe)
+	if (dev->bus->probe) {
+		pr_err("dev_name=%s, bus=%s, dev->bus->probe(%s)\n", dev->bus->dev_name, dev->bus->name, dev_name(dev));
 		ret = dev->bus->probe(dev);
-	else if (drv->probe)
+	} else if (drv->probe) {
+		pr_err("drv->probe(%s)\n", dev_name(dev));
 		ret = drv->probe(dev);
+	}
 
 	switch (ret) {
 	case 0:
