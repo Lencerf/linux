@@ -130,6 +130,19 @@ config VIRTIO_MEM
 	depends on EXCLUSIVE_SYSTEM_RAM
 	help
 	 This driver provides access to virtio-mem paravirtualized memory
+
+config VIRTIO_PGALLOC
+	tristate "Virtio pgalloc driver"
+	depends on VIRTIO
+	select PAGE_REPORTING
+	help
+	 This driver implements the guest side of virtio-pgalloc, a research
+	 device that coordinates the guest page allocator with the host
+	 memory management (backed by the vhost-pgalloc host driver). Free
+	 page blocks are reported to the host through the free page reporting
+	 mechanism; reported blocks are re-backed on demand when reallocated.
+
+	 If unsure, say M.
 	 devices, allowing to hotplug and hotunplug memory.
 
 	 This driver currently supports x86-64, arm64, riscv and s390.

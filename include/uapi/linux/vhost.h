@@ -146,6 +146,10 @@
 #define VHOST_VSOCK_SET_GUEST_CID	_IOW(VHOST_VIRTIO, 0x60, __u64)
 #define VHOST_VSOCK_SET_RUNNING		_IOW(VHOST_VIRTIO, 0x61, int)
 
+/* VHOST_PGALLOC specific defines */
+
+#define VHOST_PGALLOC_SET_RUNNING	_IOW(VHOST_VIRTIO, 0x62, int)
+
 /* VHOST_VDPA specific defines */
 
 /* Get the device id. The device ids follow the same definition of

@@ -80,6 +80,20 @@ config VHOST_VDPA
 	  To compile this driver as a module, choose M here: the module
 	  will be called vhost_vdpa.
 
+config VHOST_PGALLOC
+	tristate "vhost virtio-pgalloc driver"
+	depends on EVENTFD
+	select VHOST
+	default n
+	help
+	  This kernel module provides the host kernel backend for the
+	  virtio-pgalloc device (research). It receives page block
+	  free/alloc requests from the guest on the requestq and (in the
+	  future) emits reclaim events on the eventq.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called vhost_pgalloc.
+
 config VHOST_CROSS_ENDIAN_LEGACY
 	bool "Cross-endian support for vhost"
 	default n

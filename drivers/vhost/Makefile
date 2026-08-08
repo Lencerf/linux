@@ -8,6 +8,9 @@ vhost_scsi-y := scsi.o
 obj-$(CONFIG_VHOST_VSOCK) += vhost_vsock.o
 vhost_vsock-y := vsock.o
 
+obj-$(CONFIG_VHOST_PGALLOC) += vhost_pgalloc.o
+vhost_pgalloc-y := pgalloc.o
+
 obj-$(CONFIG_VHOST_RING) += vringh.o
 
 obj-$(CONFIG_VHOST_VDPA) += vhost_vdpa.o
