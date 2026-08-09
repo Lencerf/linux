@@ -5128,10 +5128,111 @@ static void __init shmem_destroy_inodecache(void)
 
 /* Keep the page in page cache instead of truncating it */
 static int shmem_error_remove_folio(struct address_space *mapping,
-				   struct folio *folio)
+					   struct folio *folio)
 {
 	return 0;
 }
+
+/*
+ * shmem_mark_discardable - mark or clear folios in [start, end] as discardable
+ * @mapping: shmem address space (e.g. the memfd backing guest RAM)
+ * @start: first page index
+ * @end: last page index (inclusive)
+ * @on: mark discardable (true) or clear it (false)
+ *
+ * Discardable folios are declared worthless by their owner (the guest
+ * reported the backing page block as free): reclaim drops them without
+ * writeback instead of swapping them out. Clearing the mark is done when
+ * the guest reallocates the block (Alloc request).
+ *
+ * Returns the number of folios processed, or -EINVAL if @mapping is not
+ * shmem.
+ */
+long shmem_mark_discardable(struct address_space *mapping, pgoff_t start,
+			    pgoff_t end, bool on)
+{
+	struct folio_batch fbatch;
+	pgoff_t index = start;
+	long count = 0;
+	int i;
+
+	if (!shmem_mapping(mapping))
+		return -EINVAL;
+
+	folio_batch_init(&fbatch);
+	while (filemap_get_folios(mapping, &index, end, &fbatch)) {
+		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+			struct folio *folio = fbatch.folios[i];
+			struct lruvec *lruvec;
+
+			folio_lock(folio);
+			if (folio->mapping != mapping) {
+				folio_unlock(folio);
+				continue;
+			}
+
+			/*
+			 * Reclassify the folio between the anon and file LRUs by
+			 * flipping PG_discardable (folio_is_file_lru() special-cases
+			 * it): mark = anon -> inactive file, clear = file -> active
+			 * anon. The flag flip must bracket the list move -- remove
+			 * under the old classification, flip, add under the new one
+			 * -- so counters and list placement never diverge (guide
+			 * §6). lruvec ops are serialized by lruvec_lock with no folio
+			 * lock held, matching the mlock() unevictable pattern; the
+			 * batch ref keeps the folio alive. Off-list folios (isolated
+			 * by reclaim, or still in the lru_add batch) just get the flag
+			 * flipped: the next putback/batch add classifies by the new
+			 * flag, which is exactly one counter migration.
+			 */
+			folio_unlock(folio);
+			lruvec = folio_lruvec_lock_irq(folio);
+			if (folio_test_lru(folio)) {
+				lruvec_del_folio(lruvec, folio);
+				if (on) {
+					folio_set_discardable(folio);
+					folio_clear_active(folio);
+					folio_clear_referenced(folio);
+				} else {
+					folio_clear_discardable(folio);
+					folio_set_active(folio);
+				}
+				lruvec_add_folio(lruvec, folio);
+			} else if (on) {
+				folio_set_discardable(folio);
+				folio_clear_active(folio);
+				folio_clear_referenced(folio);
+			} else {
+				folio_clear_discardable(folio);
+				folio_set_active(folio);
+			}
+			lruvec_unlock_irq(lruvec);
+
+			/* TEMP DEBUG: post-migration state of the marked folio. */
+			if (on)
+				pr_info_ratelimited(
+					"virtio_pgalloc DBG: marked discardable folio phys=%llx lru=%d active=%d unevictable=%d mlocked=%d refs=%u map=%d swapcache=%d\n",
+					(u64)folio_pfn(folio) << PAGE_SHIFT,
+					folio_test_lru(folio), folio_test_active(folio),
+					folio_test_unevictable(folio),
+					folio_test_mlocked(folio),
+					folio_ref_count(folio), folio_mapcount(folio),
+					folio_test_swapcache(folio));
+			count++;
+		}
+		folio_batch_release(&fbatch);
+		cond_resched();
+	}
+
+	/*
+	 * Flush pending lru_add batches so folios marked while still in the
+	 * batch land on the (file) LRU before reclaim/observation.
+	 */
+	lru_add_drain();
+
+	return count;
+}
+EXPORT_SYMBOL_GPL(shmem_mark_discardable);
 
 static const struct address_space_operations shmem_aops = {
 	.dirty_folio	= noop_dirty_folio,

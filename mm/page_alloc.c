@@ -54,6 +54,7 @@
 #include <linux/delayacct.h>
 #include <linux/cacheinfo.h>
 #include <linux/pgalloc_tag.h>
+#include <linux/virtio_pgalloc_ops.h>
 #include <asm/div64.h>
 #include "internal.h"
 #include "shuffle.h"
@@ -838,7 +839,7 @@ static inline void move_to_free_list(struct page *page, struct zone *zone,
 }
 
 static inline void __del_page_from_free_list(struct page *page, struct zone *zone,
-					     unsigned int order, int migratetype)
+						     unsigned int order, int migratetype)
 {
 	int nr_pages = 1 << order;
 
@@ -847,8 +848,20 @@ static inline void __del_page_from_free_list(struct page *page, struct zone *zon
 		     get_pageblock_migratetype(page), migratetype, nr_pages);
 
 	/* clear reported state and update reported page count */
-	if (page_reported(page))
-		__ClearPageReported(page);
+	if (page_reported(page)) {
+		/*
+		 * PG_reported aliases PG_uptodate (page-flags.h), so the bit is
+		 * also set on live page-cache pages. With virtio-pgalloc enabled,
+		 * keep the bit on pageblock-aligned heads only, so the alloc
+		 * hook can tell the host that a reported block was reallocated;
+		 * clear it everywhere else -- a stale uptodate bit on ordinary
+		 * pages must not be mistaken for "reported" by the page
+		 * reporting cycle.
+		 */
+		if (!static_branch_unlikely(&virtio_pgalloc_enabled) ||
+		    !IS_ALIGNED(page_to_pfn(page), pageblock_nr_pages))
+			__ClearPageReported(page);
+	}
 
 	list_del(&page->buddy_list);
 	__ClearPageBuddy(page);
@@ -1879,6 +1892,11 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
 		set_page_pfmemalloc(page);
 	else
 		clear_page_pfmemalloc(page);
+
+	/* virtio-pgalloc: notify the driver if this allocation comes from a
+	 * reported (unbacked) page block. Static key disabled: no overhead. */
+	if (static_branch_unlikely(&virtio_pgalloc_enabled))
+		virtio_pgalloc_check_alloc(page, order);
 }
 
 /*

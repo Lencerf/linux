@@ -756,6 +756,7 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 		 * same address_space.
 		 */
 		if (reclaimed && folio_is_file_lru(folio) &&
+		    !folio_test_discardable(folio) &&
 		    !mapping_exiting(mapping) && !dax_mapping(mapping))
 			shadow = workingset_eviction(folio, target_memcg);
 		__filemap_remove_folio(folio, shadow);
@@ -1227,6 +1228,22 @@ retry:
 
 		if (!ignore_references)
 			references = folio_check_references(folio, sc);
+		else
+			references = FOLIOREF_RECLAIM;
+
+		/*
+		 * Discardable folios (virtio-pgalloc) are worthless by owner
+		 * declaration: do not let a warm PTE reference (e.g. from the dd
+		 * that wrote the data before it was freed) keep them alive.
+		 */
+		if (folio_test_discardable(folio)) {
+			references = FOLIOREF_RECLAIM;
+			/* TEMP DEBUG: confirm discardable folios reach the scan. */
+			pr_info_ratelimited(
+				"virtio_pgalloc DBG: vmscan sees discardable folio phys=%llx active=%d dirty=%d\n",
+				(u64)folio_pfn(folio) << PAGE_SHIFT,
+				folio_test_active(folio), folio_test_dirty(folio));
+		}
 
 		switch (references) {
 		case FOLIOREF_ACTIVATE:
@@ -1365,6 +1382,21 @@ retry:
 			goto activate_locked;
 
 		mapping = folio_mapping(folio);
+
+		/*
+		 * Discardable folios (virtio-pgalloc): the owner declared the
+		 * data worthless, so drop them without writeback instead of
+		 * swapping them out. try_to_unmap() has already run above, so
+		 * the PTE dirty bits can no longer re-dirty the folio.
+		 */
+		if (folio_test_discardable(folio) && mapping) {
+			folio_clear_dirty(folio);
+			/* TEMP DEBUG: confirm the discardable reclaim path fires. */
+			pr_info_ratelimited(
+				"virtio_pgalloc DBG: reclaim dropping discardable folio phys=%llx nr=%u\n",
+				(u64)folio_pfn(folio) << PAGE_SHIFT, nr_pages);
+		}
+
 		if (folio_test_dirty(folio)) {
 			if (folio_is_file_lru(folio)) {
 				/*
@@ -1494,9 +1526,23 @@ retry:
 			 */
 			count_vm_events(PGLAZYFREED, nr_pages);
 			count_memcg_folio_events(folio, PGLAZYFREED, nr_pages);
-		} else if (!mapping || !__remove_mapping(mapping, folio, true,
+		} else {
+			bool drop_charge = folio_test_discardable(folio);
+
+			if (!mapping || !__remove_mapping(mapping, folio, true,
 							 sc->target_mem_cgroup))
-			goto keep_locked;
+				goto keep_locked;
+			/*
+			 * Generic page-cache removal runs no shmem callback
+			 * (shmem_aops has no .free_folio), so the inode block
+			 * charge taken by shmem_charge() lingers; release it now
+			 * like shmem_undo_range() does. PG_discardable (which
+			 * only shmem_mark_discardable() ever sets) is cleared by
+			 * __filemap_remove_folio(), hence the snapshot above.
+			 */
+			if (drop_charge)
+				shmem_uncharge(mapping->host, 0);
+		}
 
 		folio_unlock(folio);
 free_it:
@@ -2115,7 +2161,8 @@ static void shrink_active_list(unsigned long nr_to_scan,
 		}
 
 		/* Referenced or rmap lock contention: rotate */
-		if (folio_referenced(folio, 0, sc->target_mem_cgroup,
+		if (!folio_test_discardable(folio) &&
+		    folio_referenced(folio, 0, sc->target_mem_cgroup,
 				     &vm_flags) != 0) {
 			/*
 			 * Identify referenced, file-backed active folios and

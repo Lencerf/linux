@@ -223,6 +223,12 @@ void __filemap_remove_folio(struct folio *folio, void *shadow)
 	struct address_space *mapping = folio->mapping;
 
 	trace_mm_filemap_delete_from_page_cache(folio);
+	/*
+	 * The folio is leaving the page cache and will be freed; clear the
+	 * virtio-pgalloc discardable mark so the page allocator's flag
+	 * checks (PAGE_FLAGS_CHECK_AT_PREP) do not trip on reallocation.
+	 */
+	folio_clear_discardable(folio);
 	filemap_unaccount_folio(mapping, folio);
 	page_cache_delete(mapping, folio, shadow);
 }

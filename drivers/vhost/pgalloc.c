@@ -2,10 +2,11 @@
 /*
  * vhost-pgalloc: host kernel backend for virtio-pgalloc
  *
- * Receives page block requests from the guest on the requestq (P1: Free
- * requests are only logged and acknowledged; Alloc handling arrives with
- * the guest alloc hooks). The eventq is reserved for host -> guest reclaim
- * events (P4).
+ * Receives page block requests from the guest on the requestq: Free
+ * requests mark the backing shmem folios as discardable (reclaim drops
+ * them without writeback), Alloc requests clear the marks again when the
+ * guest reallocates a reported block. The eventq is reserved for
+ * host -> guest reclaim events (P4).
  *
  * Copyright (c) 2026 The virtio-pgalloc project
  */
@@ -14,11 +15,14 @@
 #include <linux/eventfd.h>
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/uio.h>
 #include <linux/vhost.h>
+#include <linux/vhost_iotlb.h>
 #include <linux/virtio_pgalloc.h>
 #include <linux/vmalloc.h>
 
@@ -34,7 +38,16 @@ static const int vhost_pgalloc_bits[] = {
 	VIRTIO_PGALLOC_F_ACPI_PXM,
 };
 
-#define VHOST_PGALLOC_FEATURES VHOST_FEATURES_U64(vhost_pgalloc_bits, 0)
+#define VHOST_PGALLOC_FEATURES \
+	(VHOST_FEATURES_U64(vhost_pgalloc_bits, 0) & \
+	 ~(1ULL << VIRTIO_RING_F_INDIRECT_DESC))
+
+/*
+ * INDIRECT_DESC is deliberately not negotiated: the guest sends Alloc
+ * notifications from the page allocator hook, where kmalloc() of an indirect
+ * descriptor table would recurse into the allocator (stack overflow). With
+ * direct descriptor chains the virtqueue_add_sgs() path is allocation-free.
+ */
 
 enum {
 	VHOST_PGALLOC_BACKEND_FEATURES = (1ULL << VHOST_BACKEND_F_IOTLB_MSG_V2)
@@ -48,7 +61,152 @@ enum {
 struct vhost_pgalloc {
 	struct vhost_dev dev;
 	struct vhost_virtqueue vqs[2];
+
+	/* managed region as negotiated with the VMM (VHOST_PGALLOC_SET_CONFIG) */
+	u64 pageblock_size;
+	u64 addr;
+	u64 region_size;
 };
+
+/* Translate a guest physical address to a host virtual address. */
+static u64 vhost_pgalloc_gpa_to_hva(struct vhost_pgalloc *pg, u64 gpa, u64 len)
+{
+	struct vhost_iotlb_map *map;
+	u64 last = gpa + len - 1;
+
+	if (!pg->dev.umem)
+		return 0;
+
+	map = vhost_iotlb_itree_first(pg->dev.umem, gpa, last);
+	if (!map || gpa < map->start || last > map->last) {
+		/* TEMP DEBUG */
+		pr_info("gpa_to_hva: no map for [%llx,%llx] (umem=%px)\n",
+			gpa, last, pg->dev.umem);
+		return 0;
+	}
+
+	/* TEMP DEBUG */
+	pr_info("gpa_to_hva: gpa=%llx len=%llu -> map[%llx,%llx] addr=%llx hva=%llx\n",
+		gpa, len, map->start, map->last, map->addr,
+		map->addr + (gpa - map->start));
+	return map->addr + (gpa - map->start);
+}
+
+/*
+ * Mark (on=1) or clear (on=0) the discardable state of the shmem folios
+ * backing the guest physical range [gpa, gpa + len).
+ */
+static int vhost_pgalloc_mark_range(struct vhost_pgalloc *pg, u64 gpa, u64 len,
+				    bool on)
+{
+	struct vm_area_struct *vma;
+	struct file *file = NULL;
+	struct address_space *mapping;
+	pgoff_t start, end;
+	u64 hva, offset;
+	long count;
+	int ret = -EINVAL;
+
+	/* TEMP DEBUG */
+	pr_info("mark_range: on=%d gpa=%llx len=%llu mm=%px\n",
+		on, gpa, len, pg->dev.mm);
+	if (!pg->dev.mm || !len)
+		return -EINVAL;
+
+	hva = vhost_pgalloc_gpa_to_hva(pg, gpa, len);
+	if (!hva) {
+		/* TEMP DEBUG */
+		pr_info("mark_range: gpa_to_hva failed\n");
+		return -EINVAL;
+	}
+
+	/* The file offset is captured while holding the mmap lock; the vma
+	 * must not be dereferenced after unlocking. */
+	mmap_read_lock(pg->dev.mm);
+	vma = find_vma(pg->dev.mm, hva);
+	if (!vma) {
+		/* TEMP DEBUG */
+		pr_info("mark_range: no vma for hva %llx\n", hva);
+		goto out_unlock;
+	}
+	/* TEMP DEBUG */
+	pr_info("mark_range: vma [%lx,%lx) file=%px pgoff=%lx\n",
+		vma->vm_start, vma->vm_end, vma->vm_file, vma->vm_pgoff);
+	if (hva < vma->vm_start || hva + len > vma->vm_end ||
+	    !vma->vm_file) {
+		/* TEMP DEBUG */
+		pr_info("mark_range: vma range/file mismatch\n");
+		goto out_unlock;
+	}
+	file = get_file(vma->vm_file);
+	offset = (vma->vm_pgoff << PAGE_SHIFT) + (hva - vma->vm_start);
+	mmap_read_unlock(pg->dev.mm);
+
+	if (!shmem_file(file)) {
+		/* TEMP DEBUG */
+		pr_info("mark_range: not a shmem file (file=%px)\n", file);
+		goto out_file;
+	}
+
+	mapping = file->f_mapping;
+	start = offset >> PAGE_SHIFT;
+	end = (offset + len - 1) >> PAGE_SHIFT;
+
+	count = shmem_mark_discardable(mapping, start, end, on);
+	/* TEMP DEBUG */
+	pr_info("mark_range: on=%d mapping=%px pgoff [%lx,%lx] count=%ld\n",
+		on, mapping, start, end, count);
+	ret = 0;
+
+out_file:
+	fput(file);
+	return ret;
+out_unlock:
+	mmap_read_unlock(pg->dev.mm);
+	return ret;
+}
+
+/*
+ * Free: the guest will not touch these blocks until reallocated, so the
+ * backing folios can be marked discardable; reclaim then drops them
+ * without writeback. The ACK is sent after the marking, so the guest
+ * only returns the blocks to its allocator once the host is in a safe
+ * state.
+ */
+static int vhost_pgalloc_handle_free(struct vhost_pgalloc *pg,
+				     struct virtio_pgalloc_req *req)
+{
+	u64 gpa = le64_to_cpu(req->gpa);
+	u64 len = le64_to_cpu(req->num_blocks) * pg->pageblock_size;
+
+	if (!pg->pageblock_size || !len)
+		return -EINVAL;
+	if (gpa < pg->addr || gpa + len > pg->addr + pg->region_size)
+		return -EINVAL;
+
+	pr_info("free gpa=%llx len=%llu\n", gpa, len);
+	return vhost_pgalloc_mark_range(pg, gpa, len, true);
+}
+
+/*
+ * Alloc: the guest reallocated a reported block; clear the discardable
+ * marks so reclaim treats the folios as normal again. (P3 adds the
+ * synchronous back with faultin; P2 only needs the mark clearing.)
+ */
+static int vhost_pgalloc_handle_alloc(struct vhost_pgalloc *pg,
+				      struct virtio_pgalloc_req *req)
+{
+	u64 gpa = le64_to_cpu(req->gpa);
+	u64 len = le64_to_cpu(req->num_blocks) * pg->pageblock_size;
+
+	if (!pg->pageblock_size || !len)
+		return -EINVAL;
+	if (gpa < pg->addr || gpa + len > pg->addr + pg->region_size)
+		return -EINVAL;
+
+	pr_debug("alloc gpa=%llx len=%llu\n", gpa, len);
+	return vhost_pgalloc_mark_range(pg, gpa, len, false);
+}
 
 static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 {
@@ -62,11 +220,20 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 
 	mutex_lock(&vq->mutex);
 
+	/* TEMP DEBUG: bisect the P2 "Free times out, L1 silent" issue.
+	 * Distinguishes: kick never arrives / early exit before processing.
+	 * Remove before commit. */
+	pr_info("kick entered: backend=%d last_avail=%u avail_cached=%u\n",
+		!!vhost_vq_get_backend(vq), vq->last_avail_idx, vq->avail_idx);
+
 	if (!vhost_vq_get_backend(vq))
 		goto out;
 
 	if (!vq_meta_prefetch(vq))
 		goto out;
+
+	pr_info("kick processing: last_avail=%u avail_cached=%u\n",
+		vq->last_avail_idx, vq->avail_idx);
 
 	vhost_disable_notify(&pg->dev, vq);
 	do {
@@ -83,6 +250,9 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 			break;
 
 		if (head == vq->num) {
+			/* TEMP DEBUG */
+			pr_info("kick no-desc: last_avail=%u avail_cached=%u\n",
+				vq->last_avail_idx, vq->avail_idx);
 			if (unlikely(vhost_enable_notify(&pg->dev, vq))) {
 				vhost_disable_notify(&pg->dev, vq);
 				continue;
@@ -109,19 +279,19 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 			continue;
 		}
 
+		/* TEMP DEBUG */
+		pr_info("kick req: head=%d out=%u in=%u len=%zu type=%u gpa=%llx blocks=%llu\n",
+			head, out, in, len, le16_to_cpu(req.type),
+			le64_to_cpu(req.gpa), le64_to_cpu(req.num_blocks));
+
 		switch (le16_to_cpu(req.type)) {
-		case VIRTIO_PGALLOC_REQ_ALLOC:
 		case VIRTIO_PGALLOC_REQ_FREE:
-			/*
-			 * P1: only log the request; the host does not touch
-			 * guest memory yet. P2 adds the discardable marking
-			 * for Free, P3 adds backing for Alloc.
-			 */
-			pr_info("req type=%s gpa=%llx blocks=%llu\n",
-				le16_to_cpu(req.type) == VIRTIO_PGALLOC_REQ_FREE
-					? "free" : "alloc",
-				le64_to_cpu(req.gpa),
-				le64_to_cpu(req.num_blocks));
+			if (vhost_pgalloc_handle_free(pg, &req))
+				resp.status = cpu_to_le16(VIRTIO_PGALLOC_RESP_ERROR);
+			break;
+		case VIRTIO_PGALLOC_REQ_ALLOC:
+			if (vhost_pgalloc_handle_alloc(pg, &req))
+				resp.status = cpu_to_le16(VIRTIO_PGALLOC_RESP_ERROR);
 			break;
 		default:
 			resp.status = cpu_to_le16(VIRTIO_PGALLOC_RESP_ERROR);
@@ -135,6 +305,9 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 				      len);
 			nbytes = copy_to_iter(&resp, sizeof(resp), &iov_iter);
 		}
+		/* TEMP DEBUG */
+		pr_info("kick resp: head=%d status=%u nbytes=%zu\n",
+			head, le16_to_cpu(resp.status), nbytes);
 		vhost_add_used(vq, head, nbytes);
 		added = true;
 	} while (likely(!vhost_exceeds_weight(vq, ++pkts, 0)));
@@ -170,6 +343,10 @@ static int vhost_pgalloc_start(struct vhost_pgalloc *pg)
 	int ret;
 
 	mutex_lock(&pg->dev.mutex);
+
+	/* TEMP DEBUG */
+	pr_info("start: pageblock=%llu addr=%llx region=%llu\n",
+		pg->pageblock_size, pg->addr, pg->region_size);
 
 	ret = vhost_dev_check_owner(&pg->dev);
 	if (ret)
@@ -339,6 +516,27 @@ static long vhost_pgalloc_dev_ioctl(struct file *f, unsigned int ioctl,
 	int r;
 
 	switch (ioctl) {
+	case VHOST_PGALLOC_SET_CONFIG: {
+		struct vhost_pgalloc_config cfg;
+
+		if (copy_from_user(&cfg, argp, sizeof(cfg)))
+			return -EFAULT;
+		if (!cfg.pageblock_size ||
+		    !is_power_of_2(cfg.pageblock_size) ||
+		    !IS_ALIGNED(cfg.addr, cfg.pageblock_size))
+			return -EINVAL;
+		/* set before VHOST_PGALLOC_SET_RUNNING; the kick handlers read
+		 * the fields without locking */
+		mutex_lock(&pg->dev.mutex);
+		pg->pageblock_size = cfg.pageblock_size;
+		pg->addr = cfg.addr;
+		pg->region_size = cfg.region_size;
+		mutex_unlock(&pg->dev.mutex);
+		/* TEMP DEBUG */
+		pr_info("set_config: pageblock=%llu addr=%llx region=%llu\n",
+			pg->pageblock_size, pg->addr, pg->region_size);
+		return 0;
+	}
 	case VHOST_PGALLOC_SET_RUNNING:
 		if (copy_from_user(&start, argp, sizeof(start)))
 			return -EFAULT;
@@ -392,6 +590,8 @@ static struct miscdevice vhost_pgalloc_misc = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name = "vhost-pgalloc",
 	.fops = &vhost_pgalloc_fops,
+	/* Dev convenience: world rw so no chmod is needed on test machines. */
+	.mode = 0666,
 };
 
 static int __init vhost_pgalloc_init(void)

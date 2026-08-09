@@ -114,10 +114,17 @@ extern unsigned long shmem_get_unmapped_area(struct file *, unsigned long addr,
 extern int shmem_lock(struct file *file, int lock, struct ucounts *ucounts);
 #ifdef CONFIG_SHMEM
 bool shmem_mapping(const struct address_space *mapping);
+long shmem_mark_discardable(struct address_space *mapping, pgoff_t start,
+			    pgoff_t end, bool on);
 #else
 static inline bool shmem_mapping(const struct address_space *mapping)
 {
 	return false;
+}
+static inline long shmem_mark_discardable(struct address_space *mapping,
+					  pgoff_t start, pgoff_t end, bool on)
+{
+	return -EINVAL;
 }
 #endif /* CONFIG_SHMEM */
 void shmem_unlock_mapping(struct address_space *mapping);

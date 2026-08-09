@@ -111,6 +111,8 @@ enum pageflags {
 	PG_swapbacked,		/* Page is backed by RAM/swap */
 	PG_unevictable,		/* Page is "unevictable"  */
 	PG_dropbehind,		/* drop pages on IO completion */
+	PG_discardable,		/* owner declared data worthless; reclaim may drop
+				 * without writeback (virtio-pgalloc) */
 #ifdef CONFIG_MMU
 	PG_mlocked,		/* Page is vma mlocked */
 #endif
@@ -597,6 +599,13 @@ PAGEFLAG(Reclaim, reclaim, PF_NO_TAIL)
 	TESTCLEARFLAG(Reclaim, reclaim, PF_NO_TAIL)
 FOLIO_FLAG(readahead, FOLIO_HEAD_PAGE)
 	FOLIO_TEST_CLEAR_FLAG(readahead, FOLIO_HEAD_PAGE)
+
+/*
+ * Discardable folios (virtio-pgalloc): the owner declared the data
+ * worthless, so reclaim drops them without writeback. Cleared when the
+ * folio leaves the page cache (__filemap_remove_folio).
+ */
+PAGEFLAG(Discardable, discardable, PF_NO_TAIL)
 
 FOLIO_FLAG(dropbehind, FOLIO_HEAD_PAGE)
 	FOLIO_TEST_CLEAR_FLAG(dropbehind, FOLIO_HEAD_PAGE)

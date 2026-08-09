@@ -27,7 +27,15 @@
  */
 static inline int folio_is_file_lru(const struct folio *folio)
 {
-	return !folio_test_swapbacked(folio);
+	/*
+	 * Discardable folios (virtio-pgalloc) are reclassified as file LRU so
+	 * that reclaim -- which scans the file lists unconditionally, even
+	 * without swap -- can drop them without writeback. PG_discardable is
+	 * flipped only while the folio is off its LRU list (see
+	 * shmem_mark_discardable()), keeping list placement and accounting
+	 * consistent.
+	 */
+	return !folio_test_swapbacked(folio) || folio_test_discardable(folio);
 }
 
 static __always_inline void __update_lru_size(struct lruvec *lruvec,

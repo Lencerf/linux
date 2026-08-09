@@ -150,6 +150,15 @@
 
 #define VHOST_PGALLOC_SET_RUNNING	_IOW(VHOST_VIRTIO, 0x62, int)
 
+struct vhost_pgalloc_config {
+	__u64 pageblock_size; /* management unit size in bytes */
+	__u64 addr;           /* guest physical start of the managed region */
+	__u64 region_size;    /* size of the managed region in bytes */
+};
+
+#define VHOST_PGALLOC_SET_CONFIG	_IOW(VHOST_VIRTIO, 0x63,\
+					     struct vhost_pgalloc_config)
+
 /* VHOST_VDPA specific defines */
 
 /* Get the device id. The device ids follow the same definition of

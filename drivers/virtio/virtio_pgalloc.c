@@ -23,12 +23,38 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
 #include <linux/virtio_pgalloc.h>
+#include <linux/virtio_pgalloc_ops.h>
+#include <linux/virtio_ring.h>
 #include <linux/page_reporting.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
 
 /* How long to wait for a host response before giving up. */
 #define VIRTIO_PGALLOC_RESP_TIMEOUT	(5 * HZ)
+
+/* Fire-and-forget Alloc notification slots. */
+#define VIRTIO_PGALLOC_ALLOC_SLOTS	64
+
+/*
+ * Always write the doorbell instead of virtqueue_kick(), which consults the
+ * EVENT_IDX avail_event field. With a vhost backend that field is only
+ * initialized by the first vhost_enable_notify(), i.e. after the first kick
+ * has already been processed; before that it holds uninitialized vring
+ * memory, so virtqueue_kick_prepare() may suppress the very first kick and
+ * the request stalls forever (observed: all requestq/eventq kicks dead until
+ * a forced notify). Always notifying is spec-legal (suppression is only an
+ * optimization) and the request rate -- one per reported 2 MiB block --
+ * makes the extra doorbell writes negligible.
+ */
+static void virtio_pgalloc_notify(struct virtqueue *vq)
+{
+	virtqueue_notify(vq);
+}
+
+struct virtio_pgalloc_alloc_slot {
+	struct virtio_pgalloc_req req;
+	struct virtio_pgalloc_resp resp;
+};
 
 struct virtio_pgalloc {
 	struct virtio_device *vdev;
@@ -44,11 +70,23 @@ struct virtio_pgalloc {
 	wait_queue_head_t req_done;
 
 	/*
-	 * One request/response slot. The page reporting workqueue calls
-	 * report() strictly serially, so a single slot is sufficient.
+	 * One request/response slot for the synchronous Free path. The page
+	 * reporting workqueue calls report() strictly serially, so a single
+	 * slot is sufficient.
 	 */
 	struct virtio_pgalloc_req req;
 	struct virtio_pgalloc_resp resp;
+	/* set by the interrupt handler when the Free response was consumed */
+	bool free_acked;
+
+	/*
+	 * Slots for fire-and-forget Alloc notifications sent from the page
+	 * allocator hook (any context, must not sleep). Freed again by the
+	 * interrupt handler when the host has consumed the buffer.
+	 */
+	struct virtio_pgalloc_alloc_slot alloc_slots[VIRTIO_PGALLOC_ALLOC_SLOTS];
+	unsigned long alloc_slots_used[BITS_TO_LONGS(VIRTIO_PGALLOC_ALLOC_SLOTS)];
+	spinlock_t alloc_slots_lock;
 
 	/* managed region as communicated by the device config */
 	u64 addr;
@@ -67,7 +105,45 @@ struct virtio_pgalloc {
 static void virtio_pgalloc_req_done(struct virtqueue *vq)
 {
 	struct virtio_pgalloc *pg = vq->vdev->priv;
+	unsigned int len;
+	void *token;
 
+	while ((token = virtqueue_get_buf(vq, &len)) != NULL) {
+		if (token == pg) {
+			WRITE_ONCE(pg->free_acked, true);
+			/* TEMP DEBUG */
+			dev_info(&pg->vdev->dev,
+				 "DBG resp: free token=%px status=%u len=%u\n",
+				 token, le16_to_cpu(pg->resp.status), len);
+		} else {
+			struct virtio_pgalloc_alloc_slot *slot = token;
+			unsigned long flags;
+
+			/*
+			 * Defensive: never trust a token that is not one of our
+			 * alloc slots. A corrupted ring (or a host writing used
+			 * entries at wrong indices) would otherwise hand us a
+			 * garbage pointer to __clear_bit() on.
+			 */
+			if (slot < pg->alloc_slots ||
+			    slot >= pg->alloc_slots + VIRTIO_PGALLOC_ALLOC_SLOTS) {
+				dev_err(&pg->vdev->dev,
+					"DBG BAD token %px (slots [%px,%px)) len=%u!\n",
+					token, pg->alloc_slots,
+					pg->alloc_slots + VIRTIO_PGALLOC_ALLOC_SLOTS,
+					len);
+				continue;
+			}
+
+			spin_lock_irqsave(&pg->alloc_slots_lock, flags);
+			__clear_bit(slot - pg->alloc_slots, pg->alloc_slots_used);
+			spin_unlock_irqrestore(&pg->alloc_slots_lock, flags);
+			/* TEMP DEBUG */
+			dev_info_ratelimited(&pg->vdev->dev,
+					     "DBG resp: alloc token=%px slot=%ld len=%u\n",
+					     token, slot - pg->alloc_slots, len);
+		}
+	}
 	wake_up(&pg->req_done);
 }
 
@@ -85,7 +161,7 @@ static void virtio_pgalloc_eventq_fill(struct virtio_pgalloc *pg)
 		if (err)
 			break;
 	}
-	virtqueue_kick(pg->eventq);
+	virtio_pgalloc_notify(pg->eventq);
 }
 
 /* Called when the host signals used buffers on the eventq. */
@@ -120,33 +196,45 @@ static int virtio_pgalloc_send_free_request(struct virtio_pgalloc *pg,
 	struct virtqueue *vq = pg->requestq;
 	struct scatterlist sg_req, sg_resp;
 	struct scatterlist *sgs[2];
-	unsigned int len;
 	int err;
 
 	pg->req.type = cpu_to_le16(VIRTIO_PGALLOC_REQ_FREE);
 	pg->req.gpa = cpu_to_le64(page_to_phys(page));
 	pg->req.num_blocks = cpu_to_le64(block_size / pg->pageblock_size);
 
+	/* TEMP DEBUG */
+	dev_info(&pg->vdev->dev,
+		 "DBG free: page=%px phys=%llx gpa=%llx blocks=%llu bs=%llu\n",
+		 page, (u64)page_to_phys(page), le64_to_cpu(pg->req.gpa),
+		 le64_to_cpu(pg->req.num_blocks), block_size);
+
 	sg_init_one(&sg_req, &pg->req, sizeof(pg->req));
 	sg_init_one(&sg_resp, &pg->resp, sizeof(pg->resp));
 	sgs[0] = &sg_req;
 	sgs[1] = &sg_resp;
 
+	WRITE_ONCE(pg->free_acked, false);
+
 	err = virtqueue_add_sgs(vq, sgs, 1, 1, pg, GFP_NOWAIT);
-	if (err)
+	if (err) {
+		dev_err(&pg->vdev->dev, "DBG free: add_sgs failed %d\n", err);
 		return err;
-	virtqueue_kick(vq);
+	}
+	virtio_pgalloc_notify(vq);
 
 	/* Wait for the host to process the request and write the response. */
 	if (!wait_event_timeout(pg->req_done,
-				virtqueue_get_buf(vq, &len) != NULL ||
-				pg->broken,
+				READ_ONCE(pg->free_acked) || pg->broken,
 				VIRTIO_PGALLOC_RESP_TIMEOUT)) {
 		dev_warn(&pg->vdev->dev,
 			 "timed out waiting for Free response (gpa %llx)\n",
 			 le64_to_cpu(pg->req.gpa));
 		return -ETIMEDOUT;
 	}
+	/* TEMP DEBUG */
+	dev_info(&pg->vdev->dev, "DBG free: acked=%d broken=%d status=%u\n",
+		 READ_ONCE(pg->free_acked), pg->broken,
+		 le16_to_cpu(pg->resp.status));
 	if (pg->broken)
 		return -EIO;
 	if (le16_to_cpu(pg->resp.status) != VIRTIO_PGALLOC_RESP_ACK) {
@@ -181,8 +269,14 @@ static int virtio_pgalloc_report(struct page_reporting_dev_info *pr_dev_info,
 		u64 block_size = sg[i].length;
 		int err;
 
-		if (gpa < pg->addr || gpa + block_size > pg->addr + pg->region_size)
+		if (gpa < pg->addr || gpa + block_size > pg->addr + pg->region_size) {
+			/* TEMP DEBUG */
+			dev_info(&pg->vdev->dev,
+				 "DBG report: skip i=%u page=%px phys=%llx bs=%llu (region [%llx,%llx))\n",
+				 i, page, gpa, block_size, pg->addr,
+				 pg->addr + pg->region_size);
 			continue;
+		}
 
 		err = virtio_pgalloc_send_free_request(pg, page, block_size);
 		if (err)
@@ -190,6 +284,72 @@ static int virtio_pgalloc_report(struct page_reporting_dev_info *pr_dev_info,
 	}
 	return 0;
 }
+
+/*
+ * Fire-and-forget Alloc notification: the guest reallocated a reported
+ * (unbacked) page block, so the host must clear the discardable marks of
+ * the backing folios. Called from the page allocator hook and must not
+ * sleep; if no slot is available the notification is dropped (the window
+ * is bounded by slot recycling and the host treats Alloc idempotently).
+ */
+static void virtio_pgalloc_unreport(void *data, struct page *head)
+{
+	struct virtio_pgalloc *pg = data;
+	struct virtio_pgalloc_alloc_slot *slot = NULL;
+	struct scatterlist sg_req, sg_resp;
+	struct scatterlist *sgs[2];
+	unsigned long flags;
+	unsigned int bit;
+	int err;
+
+	spin_lock_irqsave(&pg->alloc_slots_lock, flags);
+	bit = find_first_zero_bit(pg->alloc_slots_used,
+				  VIRTIO_PGALLOC_ALLOC_SLOTS);
+	if (bit < VIRTIO_PGALLOC_ALLOC_SLOTS) {
+		__set_bit(bit, pg->alloc_slots_used);
+		slot = &pg->alloc_slots[bit];
+	}
+	spin_unlock_irqrestore(&pg->alloc_slots_lock, flags);
+
+	if (!slot) {
+		/* TEMP DEBUG */
+		dev_info_ratelimited(&pg->vdev->dev,
+				     "DBG alloc notify: slots exhausted (dropped, phys=%llx)\n",
+				     (u64)page_to_phys(head));
+		return;
+	}
+
+	slot->req.type = cpu_to_le16(VIRTIO_PGALLOC_REQ_ALLOC);
+	slot->req.gpa = cpu_to_le64(page_to_phys(head));
+	slot->req.num_blocks = cpu_to_le64(((u64)PAGE_SIZE << pageblock_order) /
+					   pg->pageblock_size);
+
+	/* TEMP DEBUG */
+	dev_info_ratelimited(&pg->vdev->dev,
+			     "DBG alloc notify: head=%px phys=%llx slot=%u\n",
+			     head, (u64)page_to_phys(head), bit);
+
+	sg_init_one(&sg_req, &slot->req, sizeof(slot->req));
+	sg_init_one(&sg_resp, &slot->resp, sizeof(slot->resp));
+	sgs[0] = &sg_req;
+	sgs[1] = &sg_resp;
+
+	err = virtqueue_add_sgs(pg->requestq, sgs, 1, 1, slot, GFP_ATOMIC);
+	if (err) {
+		/* TEMP DEBUG */
+		dev_err(&pg->vdev->dev, "DBG alloc notify: add_sgs failed %d\n",
+			err);
+		spin_lock_irqsave(&pg->alloc_slots_lock, flags);
+		__clear_bit(slot - pg->alloc_slots, pg->alloc_slots_used);
+		spin_unlock_irqrestore(&pg->alloc_slots_lock, flags);
+		return;
+	}
+	virtio_pgalloc_notify(pg->requestq);
+}
+
+static struct virtio_pgalloc_ops virtio_pgalloc_ops = {
+	.unreport = virtio_pgalloc_unreport,
+};
 
 static int virtio_pgalloc_probe(struct virtio_device *vdev)
 {
@@ -209,6 +369,7 @@ static int virtio_pgalloc_probe(struct virtio_device *vdev)
 
 	pg->vdev = vdev;
 	init_waitqueue_head(&pg->req_done);
+	spin_lock_init(&pg->alloc_slots_lock);
 	vdev->priv = pg;
 
 	err = virtio_find_vqs(vdev, 2, vqs, vqs_info, NULL);
@@ -254,6 +415,23 @@ static int virtio_pgalloc_probe(struct virtio_device *vdev)
 		goto out_del_vqs;
 	}
 
+	/* TEMP DEBUG: ring geometry and managed region. */
+	dev_info(&vdev->dev,
+		 "DBG probe: cfg addr=%llx region=%llu pageblock=%llu node=%u\n",
+		 pg->addr, pg->region_size, pageblock_size, node_id);
+	dev_info(&vdev->dev,
+		 "DBG probe: requestq size=%u desc=%llx avail=%llx used=%llx\n",
+		 virtqueue_get_vring_size(pg->requestq),
+		 virtqueue_get_desc_addr(pg->requestq),
+		 virtqueue_get_avail_addr(pg->requestq),
+		 virtqueue_get_used_addr(pg->requestq));
+	dev_info(&vdev->dev,
+		 "DBG probe: eventq size=%u desc=%llx avail=%llx used=%llx\n",
+		 virtqueue_get_vring_size(pg->eventq),
+		 virtqueue_get_desc_addr(pg->eventq),
+		 virtqueue_get_avail_addr(pg->eventq),
+		 virtqueue_get_used_addr(pg->eventq));
+
 	pg->eventq_capacity = virtqueue_get_vring_size(pg->eventq);
 	pg->events = kcalloc(pg->eventq_capacity, sizeof(*pg->events),
 			     GFP_KERNEL);
@@ -265,9 +443,17 @@ static int virtio_pgalloc_probe(struct virtio_device *vdev)
 	pg->pr_dev_info.report = virtio_pgalloc_report;
 	pg->pr_dev_info.order = pageblock_order;
 	pg->pr_dev_info.capacity = virtqueue_get_vring_size(pg->requestq);
+
+	/*
+	 * Register the alloc-side notification first: it gates the deferred
+	 * PG_reported clear and the alloc hook, both of which must be active
+	 * before free page reporting starts.
+	 */
+	virtio_pgalloc_register_ops(&virtio_pgalloc_ops, pg);
+
 	err = page_reporting_register(&pg->pr_dev_info);
 	if (err)
-		goto out_free_events;
+		goto out_unregister_ops;
 
 	virtio_device_ready(vdev);
 	virtio_pgalloc_eventq_fill(pg);
@@ -278,7 +464,8 @@ static int virtio_pgalloc_probe(struct virtio_device *vdev)
 		 node_id);
 	return 0;
 
-out_free_events:
+out_unregister_ops:
+	virtio_pgalloc_unregister_ops(&virtio_pgalloc_ops, pg);
 	kfree(pg->events);
 out_del_vqs:
 	vdev->config->del_vqs(vdev);
@@ -297,9 +484,11 @@ static void virtio_pgalloc_remove(struct virtio_device *vdev)
 	wake_up_all(&pg->req_done);
 
 	/*
-	 * Wait for a possibly running report pass; with broken set, the
+	 * Stop the alloc-side notification first (synchronize_rcu inside),
+	 * then wait for a possibly running report pass; with broken set, the
 	 * report callback returns immediately.
 	 */
+	virtio_pgalloc_unregister_ops(&virtio_pgalloc_ops, pg);
 	page_reporting_unregister(&pg->pr_dev_info);
 
 	virtio_reset_device(vdev);
