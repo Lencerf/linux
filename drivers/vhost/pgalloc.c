@@ -79,16 +79,11 @@ static u64 vhost_pgalloc_gpa_to_hva(struct vhost_pgalloc *pg, u64 gpa, u64 len)
 
 	map = vhost_iotlb_itree_first(pg->dev.umem, gpa, last);
 	if (!map || gpa < map->start || last > map->last) {
-		/* TEMP DEBUG */
-		pr_info("gpa_to_hva: no map for [%llx,%llx] (umem=%px)\n",
-			gpa, last, pg->dev.umem);
+		pr_debug("no map for [%llx,%llx] (umem=%px)\n",
+			 gpa, last, pg->dev.umem);
 		return 0;
 	}
 
-	/* TEMP DEBUG */
-	pr_info("gpa_to_hva: gpa=%llx len=%llu -> map[%llx,%llx] addr=%llx hva=%llx\n",
-		gpa, len, map->start, map->last, map->addr,
-		map->addr + (gpa - map->start));
 	return map->addr + (gpa - map->start);
 }
 
@@ -104,38 +99,26 @@ static int vhost_pgalloc_mark_range(struct vhost_pgalloc *pg, u64 gpa, u64 len,
 	struct address_space *mapping;
 	pgoff_t start, end;
 	u64 hva, offset;
-	long count;
 	int ret = -EINVAL;
 
-	/* TEMP DEBUG */
-	pr_info("mark_range: on=%d gpa=%llx len=%llu mm=%px\n",
-		on, gpa, len, pg->dev.mm);
 	if (!pg->dev.mm || !len)
 		return -EINVAL;
 
 	hva = vhost_pgalloc_gpa_to_hva(pg, gpa, len);
-	if (!hva) {
-		/* TEMP DEBUG */
-		pr_info("mark_range: gpa_to_hva failed\n");
+	if (!hva)
 		return -EINVAL;
-	}
 
 	/* The file offset is captured while holding the mmap lock; the vma
 	 * must not be dereferenced after unlocking. */
 	mmap_read_lock(pg->dev.mm);
 	vma = find_vma(pg->dev.mm, hva);
 	if (!vma) {
-		/* TEMP DEBUG */
-		pr_info("mark_range: no vma for hva %llx\n", hva);
+		pr_debug("no vma for hva %llx\n", hva);
 		goto out_unlock;
 	}
-	/* TEMP DEBUG */
-	pr_info("mark_range: vma [%lx,%lx) file=%px pgoff=%lx\n",
-		vma->vm_start, vma->vm_end, vma->vm_file, vma->vm_pgoff);
 	if (hva < vma->vm_start || hva + len > vma->vm_end ||
 	    !vma->vm_file) {
-		/* TEMP DEBUG */
-		pr_info("mark_range: vma range/file mismatch\n");
+		pr_debug("vma range/file mismatch for hva %llx\n", hva);
 		goto out_unlock;
 	}
 	file = get_file(vma->vm_file);
@@ -143,8 +126,7 @@ static int vhost_pgalloc_mark_range(struct vhost_pgalloc *pg, u64 gpa, u64 len,
 	mmap_read_unlock(pg->dev.mm);
 
 	if (!shmem_file(file)) {
-		/* TEMP DEBUG */
-		pr_info("mark_range: not a shmem file (file=%px)\n", file);
+		pr_debug("backing file is not shmem (file=%px)\n", file);
 		goto out_file;
 	}
 
@@ -152,10 +134,7 @@ static int vhost_pgalloc_mark_range(struct vhost_pgalloc *pg, u64 gpa, u64 len,
 	start = offset >> PAGE_SHIFT;
 	end = (offset + len - 1) >> PAGE_SHIFT;
 
-	count = shmem_mark_discardable(mapping, start, end, on);
-	/* TEMP DEBUG */
-	pr_info("mark_range: on=%d mapping=%px pgoff [%lx,%lx] count=%ld\n",
-		on, mapping, start, end, count);
+	shmem_mark_discardable(mapping, start, end, on);
 	ret = 0;
 
 out_file:
@@ -184,7 +163,6 @@ static int vhost_pgalloc_handle_free(struct vhost_pgalloc *pg,
 	if (gpa < pg->addr || gpa + len > pg->addr + pg->region_size)
 		return -EINVAL;
 
-	pr_info("free gpa=%llx len=%llu\n", gpa, len);
 	return vhost_pgalloc_mark_range(pg, gpa, len, true);
 }
 
@@ -208,6 +186,22 @@ static int vhost_pgalloc_handle_alloc(struct vhost_pgalloc *pg,
 	return vhost_pgalloc_mark_range(pg, gpa, len, false);
 }
 
+/*
+ * Disable: the guest is about to stop using the device (teardown or a
+ * switch to another reporting mechanism). Clear every discardable mark in
+ * the managed region before ACKing, so no backing folio can be dropped once
+ * the guest stops sending Alloc notifications (guide §6.8).
+ */
+static int vhost_pgalloc_handle_disable(struct vhost_pgalloc *pg)
+{
+	if (!pg->pageblock_size || !pg->region_size)
+		return -EINVAL;
+
+	pr_info("disable: clearing discardable marks for region [%llx, %llx)\n",
+		pg->addr, pg->addr + pg->region_size);
+	return vhost_pgalloc_mark_range(pg, pg->addr, pg->region_size, false);
+}
+
 static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 {
 	struct vhost_virtqueue *vq = container_of(work, struct vhost_virtqueue,
@@ -220,20 +214,11 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 
 	mutex_lock(&vq->mutex);
 
-	/* TEMP DEBUG: bisect the P2 "Free times out, L1 silent" issue.
-	 * Distinguishes: kick never arrives / early exit before processing.
-	 * Remove before commit. */
-	pr_info("kick entered: backend=%d last_avail=%u avail_cached=%u\n",
-		!!vhost_vq_get_backend(vq), vq->last_avail_idx, vq->avail_idx);
-
 	if (!vhost_vq_get_backend(vq))
 		goto out;
 
 	if (!vq_meta_prefetch(vq))
 		goto out;
-
-	pr_info("kick processing: last_avail=%u avail_cached=%u\n",
-		vq->last_avail_idx, vq->avail_idx);
 
 	vhost_disable_notify(&pg->dev, vq);
 	do {
@@ -250,9 +235,6 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 			break;
 
 		if (head == vq->num) {
-			/* TEMP DEBUG */
-			pr_info("kick no-desc: last_avail=%u avail_cached=%u\n",
-				vq->last_avail_idx, vq->avail_idx);
 			if (unlikely(vhost_enable_notify(&pg->dev, vq))) {
 				vhost_disable_notify(&pg->dev, vq);
 				continue;
@@ -279,11 +261,6 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 			continue;
 		}
 
-		/* TEMP DEBUG */
-		pr_info("kick req: head=%d out=%u in=%u len=%zu type=%u gpa=%llx blocks=%llu\n",
-			head, out, in, len, le16_to_cpu(req.type),
-			le64_to_cpu(req.gpa), le64_to_cpu(req.num_blocks));
-
 		switch (le16_to_cpu(req.type)) {
 		case VIRTIO_PGALLOC_REQ_FREE:
 			if (vhost_pgalloc_handle_free(pg, &req))
@@ -291,6 +268,10 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 			break;
 		case VIRTIO_PGALLOC_REQ_ALLOC:
 			if (vhost_pgalloc_handle_alloc(pg, &req))
+				resp.status = cpu_to_le16(VIRTIO_PGALLOC_RESP_ERROR);
+			break;
+		case VIRTIO_PGALLOC_REQ_DISABLE:
+			if (vhost_pgalloc_handle_disable(pg))
 				resp.status = cpu_to_le16(VIRTIO_PGALLOC_RESP_ERROR);
 			break;
 		default:
@@ -305,9 +286,6 @@ static void vhost_pgalloc_handle_req_kick(struct vhost_work *work)
 				      len);
 			nbytes = copy_to_iter(&resp, sizeof(resp), &iov_iter);
 		}
-		/* TEMP DEBUG */
-		pr_info("kick resp: head=%d status=%u nbytes=%zu\n",
-			head, le16_to_cpu(resp.status), nbytes);
 		vhost_add_used(vq, head, nbytes);
 		added = true;
 	} while (likely(!vhost_exceeds_weight(vq, ++pkts, 0)));
@@ -343,10 +321,6 @@ static int vhost_pgalloc_start(struct vhost_pgalloc *pg)
 	int ret;
 
 	mutex_lock(&pg->dev.mutex);
-
-	/* TEMP DEBUG */
-	pr_info("start: pageblock=%llu addr=%llx region=%llu\n",
-		pg->pageblock_size, pg->addr, pg->region_size);
 
 	ret = vhost_dev_check_owner(&pg->dev);
 	if (ret)
@@ -532,9 +506,6 @@ static long vhost_pgalloc_dev_ioctl(struct file *f, unsigned int ioctl,
 		pg->addr = cfg.addr;
 		pg->region_size = cfg.region_size;
 		mutex_unlock(&pg->dev.mutex);
-		/* TEMP DEBUG */
-		pr_info("set_config: pageblock=%llu addr=%llx region=%llu\n",
-			pg->pageblock_size, pg->addr, pg->region_size);
 		return 0;
 	}
 	case VHOST_PGALLOC_SET_RUNNING:

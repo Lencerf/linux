@@ -3,6 +3,7 @@
 #include <linux/mmzone.h>
 #include <linux/page_reporting.h>
 #include <linux/gfp.h>
+#include <linux/virtio_pgalloc_ops.h>
 #include <linux/export.h>
 #include <linux/module.h>
 #include <linux/delay.h>
@@ -130,8 +131,19 @@ page_reporting_drain(struct page_reporting_dev_info *prdev,
 		 * report on the new larger page when we make our way
 		 * up to that higher order.
 		 */
-		if (PageBuddy(page) && buddy_order(page) == order)
-			__SetPageReported(page);
+		if (PageBuddy(page) && buddy_order(page) == order) {
+			/*
+			 * With virtio-pgalloc active the guest-side marker is the
+			 * dedicated PG_pgalloc_reported bit (no PG_uptodate alias, so
+			 * the alloc hook can safely wait for the Alloc ACK while the
+			 * flag stays set); otherwise fall back to the stock
+			 * PG_reported used by virtio-balloon free page reporting.
+			 */
+			if (static_branch_unlikely(&virtio_pgalloc_enabled))
+				__SetPagePgallocReported(page);
+			else
+				__SetPageReported(page);
+		}
 	} while ((sg = sg_next(sg)));
 
 	/* reinitialize scatterlist now that it is empty */
@@ -180,7 +192,7 @@ page_reporting_cycle(struct page_reporting_dev_info *prdev, struct zone *zone,
 	/* loop through free list adding unreported pages to sg list */
 	list_for_each_entry_safe(page, next, list, lru) {
 		/* We are going to skip over the reported pages. */
-		if (PageReported(page))
+		if (PageReported(page) || PagePgallocReported(page))
 			continue;
 
 		/*

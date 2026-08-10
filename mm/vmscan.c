@@ -1238,11 +1238,6 @@ retry:
 		 */
 		if (folio_test_discardable(folio)) {
 			references = FOLIOREF_RECLAIM;
-			/* TEMP DEBUG: confirm discardable folios reach the scan. */
-			pr_info_ratelimited(
-				"virtio_pgalloc DBG: vmscan sees discardable folio phys=%llx active=%d dirty=%d\n",
-				(u64)folio_pfn(folio) << PAGE_SHIFT,
-				folio_test_active(folio), folio_test_dirty(folio));
 		}
 
 		switch (references) {
@@ -1391,10 +1386,6 @@ retry:
 		 */
 		if (folio_test_discardable(folio) && mapping) {
 			folio_clear_dirty(folio);
-			/* TEMP DEBUG: confirm the discardable reclaim path fires. */
-			pr_info_ratelimited(
-				"virtio_pgalloc DBG: reclaim dropping discardable folio phys=%llx nr=%u\n",
-				(u64)folio_pfn(folio) << PAGE_SHIFT, nr_pages);
 		}
 
 		if (folio_test_dirty(folio)) {

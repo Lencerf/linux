@@ -5208,16 +5208,6 @@ long shmem_mark_discardable(struct address_space *mapping, pgoff_t start,
 			}
 			lruvec_unlock_irq(lruvec);
 
-			/* TEMP DEBUG: post-migration state of the marked folio. */
-			if (on)
-				pr_info_ratelimited(
-					"virtio_pgalloc DBG: marked discardable folio phys=%llx lru=%d active=%d unevictable=%d mlocked=%d refs=%u map=%d swapcache=%d\n",
-					(u64)folio_pfn(folio) << PAGE_SHIFT,
-					folio_test_lru(folio), folio_test_active(folio),
-					folio_test_unevictable(folio),
-					folio_test_mlocked(folio),
-					folio_ref_count(folio), folio_mapcount(folio),
-					folio_test_swapcache(folio));
 			count++;
 		}
 		folio_batch_release(&fbatch);

@@ -113,6 +113,9 @@ enum pageflags {
 	PG_dropbehind,		/* drop pages on IO completion */
 	PG_discardable,		/* owner declared data worthless; reclaim may drop
 				 * without writeback (virtio-pgalloc) */
+	PG_pgalloc_reported,	/* guest-side: pageblock reported to host as free
+				 * (unbacked); cleared only after the host ACKs the
+				 * reallocation (virtio-pgalloc) */
 #ifdef CONFIG_MMU
 	PG_mlocked,		/* Page is vma mlocked */
 #endif
@@ -606,6 +609,17 @@ FOLIO_FLAG(readahead, FOLIO_HEAD_PAGE)
  * folio leaves the page cache (__filemap_remove_folio).
  */
 PAGEFLAG(Discardable, discardable, PF_NO_TAIL)
+
+/*
+ * Guest-side reported marker (virtio-pgalloc): set by the free page
+ * reporting drain on pageblock-aligned heads once the host has acknowledged
+ * the block as free, kept by __del_page_from_free_list() on pageblock-aligned
+ * heads so the alloc hook can tell the host when the block is reallocated.
+ * A dedicated bit (instead of the PG_reported/PG_uptodate alias) so the alloc
+ * hook never mistakes a live page-cache page's uptodate state for "reported"
+ * (guide B.8) and so the flag can stay set while a sync Alloc is in flight.
+ */
+__PAGEFLAG(PgallocReported, pgalloc_reported, PF_NO_TAIL)
 
 FOLIO_FLAG(dropbehind, FOLIO_HEAD_PAGE)
 	FOLIO_TEST_CLEAR_FLAG(dropbehind, FOLIO_HEAD_PAGE)

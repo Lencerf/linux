@@ -847,21 +847,21 @@ static inline void __del_page_from_free_list(struct page *page, struct zone *zon
 		     "page type is %d, passed migratetype is %d (nr=%d)\n",
 		     get_pageblock_migratetype(page), migratetype, nr_pages);
 
-	/* clear reported state and update reported page count */
-	if (page_reported(page)) {
-		/*
-		 * PG_reported aliases PG_uptodate (page-flags.h), so the bit is
-		 * also set on live page-cache pages. With virtio-pgalloc enabled,
-		 * keep the bit on pageblock-aligned heads only, so the alloc
-		 * hook can tell the host that a reported block was reallocated;
-		 * clear it everywhere else -- a stale uptodate bit on ordinary
-		 * pages must not be mistaken for "reported" by the page
-		 * reporting cycle.
-		 */
-		if (!static_branch_unlikely(&virtio_pgalloc_enabled) ||
-		    !IS_ALIGNED(page_to_pfn(page), pageblock_nr_pages))
-			__ClearPageReported(page);
-	}
+	/* clear reported state (virtio-balloon free page reporting) */
+	if (page_reported(page))
+		__ClearPageReported(page);
+
+	/*
+	 * virtio-pgalloc guest-side marker: keep it on pageblock-aligned heads
+	 * so the alloc hook can tell the host that a reported block was
+	 * reallocated; clear it everywhere else -- it must not linger on live
+	 * pages. It is a dedicated bit, not the PG_reported/PG_uptodate alias,
+	 * so it never collides with page-cache state (guide B.8).
+	 */
+	if (PagePgallocReported(page) &&
+	    (!static_branch_unlikely(&virtio_pgalloc_enabled) ||
+	     !IS_ALIGNED(page_to_pfn(page), pageblock_nr_pages)))
+		__ClearPagePgallocReported(page);
 
 	list_del(&page->buddy_list);
 	__ClearPageBuddy(page);
@@ -1896,7 +1896,30 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
 	/* virtio-pgalloc: notify the driver if this allocation comes from a
 	 * reported (unbacked) page block. Static key disabled: no overhead. */
 	if (static_branch_unlikely(&virtio_pgalloc_enabled))
-		virtio_pgalloc_check_alloc(page, order);
+		virtio_pgalloc_check_alloc(page, order, gfp_flags);
+}
+
+/*
+ * Max consecutive unbacked pages a non-blocking allocation will rotate past
+ * on a PCP list before failing (falls back to the buddy lists, which skip
+ * the same blocks).
+ */
+#define VIRTIO_PGALLOC_PCP_MAX_SKIP	64
+
+/*
+ * virtio-pgalloc: is this free-list page inside a pageblock the guest has
+ * reported to the host as free (unbacked)? Non-blocking allocations must
+ * not consume such blocks -- they cannot wait for the Alloc ACK, so writing
+ * to them before the host processes the notification would race with a
+ * discard (guide §6.6.2). Over-skipping (a block whose head is no longer
+ * marked) is harmless: only a missed skip is a correctness issue.
+ */
+static inline bool virtio_pgalloc_block_reported(struct page *page)
+{
+	if (!static_branch_unlikely(&virtio_pgalloc_enabled))
+		return false;
+	return PagePgallocReported(
+		pfn_to_page(ALIGN_DOWN(page_to_pfn(page), pageblock_nr_pages)));
 }
 
 /*
@@ -1905,7 +1928,7 @@ static void prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags
  */
 static __always_inline
 struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
-						int migratetype)
+					int migratetype, bool skip_reported)
 {
 	unsigned int current_order;
 	struct free_area *area;
@@ -1917,6 +1940,24 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 		page = get_page_from_free_area(area, migratetype);
 		if (!page)
 			continue;
+
+		if (skip_reported && virtio_pgalloc_block_reported(page)) {
+			struct list_head *pos;
+
+			/* Walk the list for the first non-reported block. */
+			page = NULL;
+			list_for_each(pos, &area->free_list[migratetype]) {
+				struct page *cand = list_entry(pos, struct page,
+								 buddy_list);
+
+				if (!virtio_pgalloc_block_reported(cand)) {
+					page = cand;
+					break;
+				}
+			}
+			if (!page)
+				continue;
+		}
 
 		page_del_and_expand(zone, page, order, current_order,
 				    migratetype);
@@ -1944,13 +1985,16 @@ static int fallbacks[MIGRATE_PCPTYPES][MIGRATE_PCPTYPES - 1] = {
 
 #ifdef CONFIG_CMA
 static __always_inline struct page *__rmqueue_cma_fallback(struct zone *zone,
-					unsigned int order)
+					unsigned int order, bool skip_reported)
 {
-	return __rmqueue_smallest(zone, order, MIGRATE_CMA);
+	return __rmqueue_smallest(zone, order, MIGRATE_CMA, skip_reported);
 }
 #else
 static inline struct page *__rmqueue_cma_fallback(struct zone *zone,
-					unsigned int order) { return NULL; }
+					unsigned int order, bool skip_reported)
+{
+	return NULL;
+}
 #endif
 
 /*
@@ -2361,7 +2405,8 @@ try_to_claim_block(struct zone *zone, struct page *page,
 			page_group_by_mobility_disabled) {
 		__move_freepages_block(zone, start_pfn, block_type, start_type);
 		set_pageblock_migratetype(pfn_to_page(start_pfn), start_type);
-		return __rmqueue_smallest(zone, order, start_type);
+		return __rmqueue_smallest(zone, order, start_type,
+					alloc_flags & ALLOC_NON_BLOCK);
 	}
 
 	return NULL;
@@ -2483,7 +2528,8 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 		if (alloc_flags & ALLOC_CMA &&
 		    zone_page_state(zone, NR_FREE_CMA_PAGES) >
 		    zone_page_state(zone, NR_FREE_PAGES) / 2) {
-			page = __rmqueue_cma_fallback(zone, order);
+			page = __rmqueue_cma_fallback(zone, order,
+						alloc_flags & ALLOC_NON_BLOCK);
 			if (page)
 				return page;
 		}
@@ -2500,13 +2546,15 @@ __rmqueue(struct zone *zone, unsigned int order, int migratetype,
 	 */
 	switch (*mode) {
 	case RMQUEUE_NORMAL:
-		page = __rmqueue_smallest(zone, order, migratetype);
+		page = __rmqueue_smallest(zone, order, migratetype,
+					alloc_flags & ALLOC_NON_BLOCK);
 		if (page)
 			return page;
 		fallthrough;
 	case RMQUEUE_CMA:
 		if (alloc_flags & ALLOC_CMA) {
-			page = __rmqueue_cma_fallback(zone, order);
+			page = __rmqueue_cma_fallback(zone, order,
+						alloc_flags & ALLOC_NON_BLOCK);
 			if (page) {
 				*mode = RMQUEUE_CMA;
 				return page;
@@ -3241,7 +3289,8 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
 			spin_lock_irqsave(&zone->lock, flags);
 		}
 		if (alloc_flags & ALLOC_HIGHATOMIC)
-			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+			page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC,
+						alloc_flags & ALLOC_NON_BLOCK);
 		if (!page) {
 			enum rmqueue_mode rmqm = RMQUEUE_NORMAL;
 
@@ -3254,7 +3303,8 @@ struct page *rmqueue_buddy(struct zone *preferred_zone, struct zone *zone,
 			 * high-order atomic allocation in the future.
 			 */
 			if (!page && (alloc_flags & (ALLOC_OOM|ALLOC_NON_BLOCK)))
-				page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC);
+				page = __rmqueue_smallest(zone, order, MIGRATE_HIGHATOMIC,
+							alloc_flags & ALLOC_NON_BLOCK);
 
 			if (!page) {
 				spin_unlock_irqrestore(&zone->lock, flags);
@@ -3336,8 +3386,9 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 			struct list_head *list)
 {
 	struct page *page;
+	unsigned int skip = 0;
 
-	do {
+	for (;;) {
 		if (list_empty(list)) {
 			int batch = nr_pcp_alloc(pcp, zone, order);
 			int alloced;
@@ -3368,9 +3419,27 @@ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
 		page = list_first_entry(list, struct page, pcp_list);
 		list_del(&page->pcp_list);
 		pcp->count -= 1 << order;
-	} while (check_new_pages(page, order));
 
-	return page;
+		/*
+		 * virtio-pgalloc: non-blocking allocations must not consume pages
+		 * from unbacked (reported) blocks -- they cannot wait for the
+		 * Alloc ACK (guide §6.6.2). Rotate such pages to the back of the
+		 * list; if the whole list turns out to be unbacked, fail so the
+		 * caller falls back to the buddy lists (which skip the same
+		 * blocks) and ultimately to an allocation failure.
+		 */
+		if ((alloc_flags & ALLOC_NON_BLOCK) &&
+		    virtio_pgalloc_block_reported(page)) {
+			list_add_tail(&page->pcp_list, list);
+			pcp->count += 1 << order;
+			if (++skip > VIRTIO_PGALLOC_PCP_MAX_SKIP)
+				return NULL;
+			continue;
+		}
+
+		if (!check_new_pages(page, order))
+			return page;
+	}
 }
 
 /* Lock and remove page from the per-cpu list */

@@ -42,6 +42,8 @@ struct virtio_pgalloc_config {
 /* Request types on the requestq */
 #define VIRTIO_PGALLOC_REQ_ALLOC	0
 #define VIRTIO_PGALLOC_REQ_FREE		1
+#define VIRTIO_PGALLOC_REQ_DISABLE	2 /* v0.6: clear all marks in the region before
+					 * the driver stops notifying (teardown handshake) */
 
 struct virtio_pgalloc_req {
 	__le16 type;
